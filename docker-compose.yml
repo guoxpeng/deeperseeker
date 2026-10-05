@@ -3,7 +3,12 @@ services:
     build: .
     container_name: deeperseeker
     ports:
-      - "127.0.0.1:4000:4000"
+      # 默认只绑回环（安全）。要让局域网里的其它设备（Claude Desktop 等）连上，
+      # 在 .env 里设 DEEPSEEKER_BIND=0.0.0.0 即可 —— .env 不入库，
+      # 所以本机与部署机上可以各自不同，也不会被 git 更新覆盖。
+      - "${DEEPSEEKER_BIND:-127.0.0.1}:4000:4000"
+      # HTTPS 监听端口，需要同时设置 DEEPSEEKER_HTTPS_ENABLED=1。
+      - "${DEEPSEEKER_BIND:-127.0.0.1}:4443:4443"
     environment:
       - HOST=0.0.0.0
     env_file:
@@ -13,6 +18,12 @@ services:
       - deeperseeker_data:/app/data
     shm_size: "1gb"
     restart: unless-stopped
+    # 容器以 root 进入入口脚本，脚本把 /app/data 属主修正为 uid 10001 后
+    # setuid 降权运行应用；禁止提权，避免降权后又能拿回 root。
+    security_opt:
+      - no-new-privileges:true
+    # 从旧版本升级不再需要手动 chown 数据卷 —— docker-entrypoint.py 会在
+    # 启动时自动修正。若数据卷是只读挂载，设 DEEPSEEKER_SKIP_CHOWN=1 跳过。
 
 volumes:
   deeperseeker_data:

@@ -2,11 +2,32 @@
 .gitignore
 .venv
 venv
+deeperseeker_env
 __pycache__
 *.pyc
+*.pyo
 .env
 *.db
 *.db.bak
+*.db-wal
+*.db-shm
+api_key.txt
 aws_cookies_deepseek.json
 .codegraph
 .opencode
+.omo
+
+# 本地界面预览产物与工作区数据（体积大，且与运行无关）
+.preview
+.workbuddy-ai
+tls
+
+# 文档与开发期文件不进镜像
+tests
+*.md
+!README.md
+requirements-dev.txt
+requirements-playwright.txt
+.pytest_cache
+.ruff_cache
+.mypy_cache
