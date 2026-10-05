@@ -157,6 +157,17 @@ git fetch --unshallow origin            # 若是 true，用这个补齐历史
 
 克隆时也不要加 `--depth`。
 
+**`git fetch origin` 拉不到 `custom` 分支。** 如果仓库当初是用 `--single-branch`
+（或 `--depth`）克隆的，`remote.origin.fetch` 只会配 `main` 一条，远端其它分支
+永远拉不下来：
+
+```sh
+git config --get-all remote.origin.fetch
+# 若只输出 +refs/heads/main:refs/remotes/origin/main，改成全分支：
+git config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+git fetch origin --prune
+```
+
 **`docker compose build` 后镜像名变了。** `docker-compose.yml` 里显式写了
 `image: deeperseeker:local`；否则 compose 会自动生成
 `deeperseeker-deeperseeker` 这类名字，写 `docker run` 时不好引用。
