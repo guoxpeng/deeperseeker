@@ -106,15 +106,23 @@ check_symbol update.sh 'verify-custom.sh'          '同步：内置定制校验'
 echo "  （以上未列出的即为通过）"
 
 # --- 3. 脚本可执行位 ---------------------------------------------------------
+# 看 git 索引里的 mode，而不是本地文件权限位：
+#   1) 索引里的 mode 才是决定 NAS（Linux）检出后能否执行的东西；
+#   2) Windows 上 [ -x ] 不可靠，检查索引在哪个平台都能测。
 echo
-echo "[3/4] 脚本可执行位"
-for f in update.sh deploy/nas-deploy.sh deploy/run-tests.sh; do
+echo "[3/4] 脚本可执行位（git 索引 mode 应为 100755）"
+for f in update.sh deploy/nas-deploy.sh deploy/run-tests.sh deploy/verify-custom.sh; do
     if [ ! -f "$f" ]; then
         fail "$f 不存在"
-    elif [ -x "$f" ]; then
+        continue
+    fi
+    MODE="$(git ls-files -s -- "$f" 2>/dev/null | awk 'NR==1{print $1}')"
+    if [ "$MODE" = "100755" ]; then
         ok
+    elif [ -z "$MODE" ]; then
+        fail "$f 没有被 git 跟踪"
     else
-        fail "$f 丢了可执行位（git update-index --chmod=+x $f）"
+        fail "$f 在 git 里的 mode 是 $MODE（应为 100755）：git update-index --chmod=+x $f"
     fi
 done
 

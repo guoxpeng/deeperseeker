@@ -75,6 +75,16 @@ git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null |
 CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
 info "相对 $MIRROR_BRANCH 的定制文件共 ${CUSTOM_TOTAL:-0} 个，已记录，合并后会逐个核对。"
 
+# 基线：先确认定制本来是完好的，这样万一第 6 步报错能正确归因。
+if [ -f deploy/verify-custom.sh ]; then
+    if MIRROR_BRANCH="$MIRROR_BRANCH" sh ./deploy/verify-custom.sh >/dev/null 2>&1; then
+        info "基线校验：当前定制完好。"
+    else
+        warn "基线校验：当前定制**本来就不完整**（与本次同步无关）。"
+        warn "建议先单独跑 ./deploy/verify-custom.sh 看看，再决定要不要继续同步。"
+    fi
+fi
+
 # --- 4. 快进 main（上游镜像必须是纯的）--------------------------------------
 info "切到 $MIRROR_BRANCH 并快进…"
 git checkout "$MIRROR_BRANCH"
