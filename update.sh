@@ -25,6 +25,7 @@ UPSTREAM_URL="${UPSTREAM_URL:-https://github.com/AmanCode22/deeperseeker.git}"
 UPSTREAM_REMOTE="${UPSTREAM_REMOTE:-upstream}"
 MIRROR_BRANCH="${MIRROR_BRANCH:-main}"
 WORK_BRANCH="${WORK_BRANCH:-custom}"
+BACKUP_BRANCH="${BACKUP_BRANCH:-presync}"
 CHECK_ONLY=0
 [ "${1:-}" = "--check" ] && CHECK_ONLY=1
 
@@ -74,6 +75,12 @@ SNAPSHOT="$(mktemp 2>/dev/null || echo "/tmp/deeperseeker-custom-$$.txt")"
 git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null || true
 CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
 info "相对 $MIRROR_BRANCH 的定制文件共 ${CUSTOM_TOTAL:-0} 个，已记录，合并后会逐个核对。"
+
+# 还原点：把 $BACKUP_BRANCH 指到同步前的 $WORK_BRANCH。
+# 它只是个本地分支，不会被 push；好处是过很久也能一键回到「同步之前」，
+# 而 ORIG_HEAD 只记得最近一次操作。
+git branch -f "$BACKUP_BRANCH" "$WORK_BRANCH" 2>/dev/null || true
+info "还原点：$BACKUP_BRANCH -> 同步前的 $WORK_BRANCH（$(git rev-parse --short "$WORK_BRANCH")）"
 
 # 基线：先确认定制本来是完好的，这样万一第 6 步报错能正确归因。
 if [ -f deploy/verify-custom.sh ]; then
@@ -153,7 +160,8 @@ if [ -n "$LOST_LIST" ]; then
     warn "多数情况是上游采纳了同样的改动；但也可能是我们的改动被覆盖了。"
     warn "本次合并还没推送，可以先看一眼再决定："
     echo "    git diff $MIRROR_BRANCH..$WORK_BRANCH -- <上面的文件>"
-    echo "    git reset --hard ORIG_HEAD      # 整体撤销这次合并"
+    echo "    git reset --hard ORIG_HEAD      # 撤销这次合并"
+    echo "    git reset --hard $BACKUP_BRANCH # 回到「同步之前」的完整状态"
 fi
 
 # --- 汇总 --------------------------------------------------------------------

@@ -156,7 +156,8 @@ else
     echo
     echo "如果这是在 update.sh 同步之后发生的，很可能是上游改动覆盖了我们的代码。"
     echo "本次合并尚未推送，可以整体撤销："
-    echo "    git reset --hard ORIG_HEAD"
+    echo "    git reset --hard ORIG_HEAD     # 撤销最近一次合并"
+    echo "    git reset --hard presync       # 回到 update.sh 记录的「同步之前」"
     echo "然后看看到底哪个文件被改了："
     echo "    git log --oneline ORIG_HEAD..HEAD"
     exit 1
