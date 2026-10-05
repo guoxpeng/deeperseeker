@@ -1,0 +1,25 @@
+# 统一换行符：仓库内文本一律存 LF。
+#
+# 本仓库的 shell 脚本（update.sh、deploy/nas-deploy.sh）要在 Linux（NAS）上
+# 直接执行。如果 blob 里带 CRLF，shebang 会变成 `bad interpreter: /bin/sh^M`，
+# 脚本根本跑不起来。这里显式钉死，不依赖任何人本地的 core.autocrlf 设置。
+* text=auto eol=lf
+
+# 二进制文件不做任何转换
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.svg  text eol=lf
+*.woff binary
+*.woff2 binary
+*.ttf  binary
+*.pdf  binary
+*.zip  binary
+*.gz   binary
+*.db   binary
+
+# Windows 专用的批处理必须保留 CRLF，否则 cmd.exe 会解析出错
+*.bat text eol=crlf
+*.cmd text eol=crlf
