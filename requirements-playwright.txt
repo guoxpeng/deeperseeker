@@ -1,0 +1,13 @@
+# 可选依赖：仅在需要回退到「用 Playwright 抓取 AWS WAF Cookie」的备用机制时安装。
+#
+# 默认运行路径不依赖它 —— DeepSeek 对使用 Android 客户端请求头的请求不再强制
+# 校验 AWS WAF，所以 Cookie 抓取只是兜底方案（见 functions.py 中
+# get_cookies / _generate_cookies）。不装它可以让镜像小几百 MB。
+#
+# 安装后还需要下载浏览器内核：
+#     pip install -r requirements-playwright.txt
+#     playwright install chromium
+# 在无图形界面的容器里运行时，要配合 xvfb-run（见 Dockerfile 末尾注释）。
+
+-r requirements.txt
+playwright>=1.45,<2.0

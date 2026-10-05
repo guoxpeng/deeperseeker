@@ -1,9 +1,23 @@
-wasmtime
-playwright
-aiohttp
-uvicorn
-fastapi
-python-multipart
-jinja2
-deepseek-tokenizer
-python-dotenv
+# DeeperSeeker 运行时依赖。
+#
+# 版本策略：写下限 + 主版本上限。下限保证不会装到缺少所需 API 的老版本，
+# 上限挡住上游破坏性的大版本变更。需要复现某一具体构建时，用
+# `pip freeze > requirements.lock.txt` 生成锁文件。
+#
+# 注意：playwright / Chromium 已不在默认依赖中。默认请求路径改用 Android
+# 客户端请求头，不再需要 WAF Cookie 抓取；只有在回退到备用 Cookie 机制时
+# 才需要安装 requirements-playwright.txt。
+
+fastapi>=0.115,<1.0
+uvicorn>=0.30,<1.0
+aiohttp>=3.9,<4.0
+jinja2>=3.1,<4.0
+python-multipart>=0.0.9,<1.0
+python-dotenv>=1.0,<2.0
+deepseek-tokenizer>=0.3.0,<1.0
+# PoW（工作量证明）求解器宿主；代码只用到 Engine / Module / Linker /
+# Store / Memory 这组长期稳定的 API。
+wasmtime>=20.0
+# 自签 HTTPS 证书的生成与解析（tls_helper.py）。带 manylinux/musllinux
+# 预编译轮子，不需要本地编译工具链。
+cryptography>=42.0,<50.0
