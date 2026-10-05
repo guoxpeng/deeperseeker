@@ -29,45 +29,82 @@
 4. 切到 `main`，`git merge --ff-only upstream/main`；
 5. 切到 `custom`，`git merge main`；有冲突就打印处理步骤并以非 0 退出。
 
-合并完先跑一遍测试再部署：
+如果第 4 步报「`main` 不是纯上游镜像」，说明有提交被误提到 `main` 上了，
+按脚本打印的命令把提交挪到 `custom` 即可。
+
+## 跑测试门禁
+
+`tests/` 与 `requirements-dev.txt` 被 `.dockerignore` 排除在镜像之外（镜像要小），
+所以不能直接 `docker compose run ... pytest tests`。用配套脚本：
 
 ```sh
-docker compose build
-docker compose run --rm --entrypoint sh deeperseeker -c 'python -m pytest tests -q'
+./deploy/run-tests.sh                        # 构建镜像并跑全部测试
+./deploy/run-tests.sh tests/test_users.py    # 只跑指定文件
+SKIP_BUILD=1 ./deploy/run-tests.sh           # 复用已有镜像
 ```
+
+它做的是：`docker build` → `docker run` 时把 `tests/` 只读挂进 `/app/tests` →
+容器里临时装 pytest → 跑测试。用的是**和生产同一个镜像**，所以不会出现
+「本机能过、容器里挂」。
 
 ## 部署到 NAS
 
-NAS 上的 `/root/deeperseeker` 是这个仓库的 git clone。一次性的初始设置：
-
-```sh
-cd /root/deeperseeker
-git remote set-url origin https://github.com/guoxpeng/deeperseeker.git
-git fetch origin
-git checkout custom
-```
-
-之后每次更新，在 NAS 上跑一条命令即可：
+NAS 上的 `/root/deeperseeker` 是这个仓库的 git clone。之后每次更新，
+在 NAS 上跑一条命令即可：
 
 ```sh
 /root/deeperseeker/deploy/nas-deploy.sh
 ```
 
-它会：`git fetch` → `git reset --hard origin/custom` → `docker compose build` →
-`docker compose up -d` → 等 healthy → 验收（HTTP / HTTPS / 数据条数）→ 打印回滚命令。
+它会：`git fetch origin` → 切到 `custom`（首次会自动从 `main` 切过去）→
+`docker compose build` → `docker compose up -d` → 等 healthy →
+验收（HTTP / HTTPS / 数据条数）→ 打印回滚命令。
 
-`.env` 与数据卷（`deeperseeker_data`）都在 `.gitignore` 里，`git reset --hard`
-不会碰它们。**部署机上需要保留的差异（例如绑定 `0.0.0.0`）一律写进 `.env`**，
-不要改 `docker-compose.yml` —— 那个文件是入库的，会被重置。
+预演（只切分支、不重建镜像、不重启容器）：
+
+```sh
+DEPLOY_DRY_RUN=1 /root/deeperseeker/deploy/nas-deploy.sh
+```
+
+### 部署机的差异一律写进 `.env`
+
+`.env` 不在 git 里，`git reset --hard` / `git checkout -f` 都不会碰它。
+**需要保留的部署机差异（例如绑定 `0.0.0.0`）都写进 `.env`，不要改
+`docker-compose.yml`** —— 后者是入库的，会被重置。
+
+NAS 上必须有一行：
+
+```sh
+DEEPSEEKER_BIND=0.0.0.0
+```
+
+少了它，compose 会把端口绑到默认的 `127.0.0.1`，宿主上的反向代理
+（`https://192.168.5.3:14000`）就连不上容器了。`nas-deploy.sh` 会对此告警。
 
 ## 推送到自己的仓库
 
 ```sh
-git push origin main      # 让 fork 的 main 与上游保持一致（可选但推荐）
-git push origin custom    # 你的定制
+git push origin custom    # 你的定制（日常只需要推这个）
+git push origin main      # 仅当 main 跟上游前进过（可选但推荐）
 ```
 
 > 本机 `git push` 可能会被沙箱杀掉；如果失败，改用仓库配套的 GitHub API 推送脚本。
+
+## 故障排查
+
+**仓库不能是浅克隆（shallow）。** 浅克隆会让推送、合并、`merge-base` 出现各种
+莫名其妙的问题。检查与修复：
+
+```sh
+git rev-parse --is-shallow-repository   # 必须输出 false
+git fetch --unshallow origin            # 若是 true，用这个补齐历史
+```
+
+克隆时也不要加 `--depth`。
+
+**`docker compose build` 后镜像名变了。** `docker-compose.yml` 里显式写了
+`image: deeperseeker:local`；否则 compose 会自动生成
+`deeperseeker-deeperseeker` 这类名字，写 `docker run` 时不好引用。
 
 ## 为什么不用 `docker-compose.override.yml`
 
