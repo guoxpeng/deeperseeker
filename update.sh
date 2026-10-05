@@ -8,6 +8,7 @@
 #
 # 本脚本做的事：
 #   git fetch upstream  ->  main 快进到 upstream/main  ->  custom 合并 main
+#   ->  校验我们的定制有没有被吞掉
 #
 # 用法：
 #   ./update.sh            同步并合并到 custom
@@ -68,7 +69,13 @@ else
 fi
 [ "$CHECK_ONLY" -eq 1 ] && exit 0
 
-# --- 3. 快进 main（上游镜像必须是纯的）--------------------------------------
+# --- 3. 记录同步前的定制清单（合并后用来核对没被吞掉）------------------------
+SNAPSHOT="$(mktemp 2>/dev/null || echo "/tmp/deeperseeker-custom-$$.txt")"
+git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null || true
+CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
+info "相对 $MIRROR_BRANCH 的定制文件共 ${CUSTOM_TOTAL:-0} 个，已记录，合并后会逐个核对。"
+
+# --- 4. 快进 main（上游镜像必须是纯的）--------------------------------------
 info "切到 $MIRROR_BRANCH 并快进…"
 git checkout "$MIRROR_BRANCH"
 if ! git merge --ff-only "$UPSTREAM_REMOTE/main" >/dev/null 2>&1; then
@@ -81,16 +88,11 @@ if ! git merge --ff-only "$UPSTREAM_REMOTE/main" >/dev/null 2>&1; then
 fi
 ok "$MIRROR_BRANCH -> $(git rev-parse --short HEAD)"
 
-# --- 4. 合并进定制分支 -------------------------------------------------------
+# --- 5. 合并进定制分支 -------------------------------------------------------
 info "切到 $WORK_BRANCH 并合并 $MIRROR_BRANCH…"
 git checkout "$WORK_BRANCH"
 if git merge "$MIRROR_BRANCH" --no-edit; then
     ok "已合并到 $WORK_BRANCH（当前 $(git rev-parse --short HEAD)）。"
-    echo
-    echo "接下来："
-    echo "  1) 跑测试确认没被上游改动影响：  docker compose build && docker compose run --rm --entrypoint sh deeperseeker -c 'python -m pytest tests -q'"
-    echo "  2) 部署到 NAS：                  ./deploy/nas-deploy.sh（在 NAS 上执行）"
-    echo "  3) 推到你自己的仓库：            git push origin $WORK_BRANCH"
 else
     echo
     warn "合并有冲突，需要手工解决："
@@ -99,5 +101,61 @@ else
     echo "  git add <文件> && git commit"
     echo "  # 想放弃这次合并："
     echo "  git merge --abort"
+    echo
+    warn "⚠️  解决冲突时不要把整个文件切成上游版本 —— 那会把我们的改动一起丢掉。"
+    echo "  解决完、commit 之后，务必再核对一遍定制还在不在："
+    echo "      ./deploy/verify-custom.sh"
+    echo "      git diff $MIRROR_BRANCH..$WORK_BRANCH   # 看我们的改动是否还在"
+    exit 1
+fi
+
+# --- 6. 校验定制没被吞掉 -----------------------------------------------------
+# 双分支流程保证第 4 步不可能冲突，但「git 自动合并成功、却把我们的改动覆盖掉」
+# 这种静默丢失仍有可能，只能靠事后核对发现。
+echo
+echo "=============== 6. 校验定制未被吞掉 ==============="
+VERIFY_RC=0
+if [ -f deploy/verify-custom.sh ]; then
+    MIRROR_BRANCH="$MIRROR_BRANCH" sh ./deploy/verify-custom.sh || VERIFY_RC=$?
+else
+    warn "没有 deploy/verify-custom.sh，跳过锚点校验。"
+fi
+
+# 文件级核对：同步前我们改过的文件，现在是否仍与 main 不同。
+# 如果某个文件现在和 main 一模一样，说明我们的那份改动不见了。
+LOST_LIST=""
+while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    if [ ! -e "$f" ]; then
+        LOST_LIST="${LOST_LIST}  ${f}   （文件不存在了）
+"
+    elif git diff --quiet "$MIRROR_BRANCH" -- "$f" 2>/dev/null; then
+        LOST_LIST="${LOST_LIST}  ${f}
+"
+    fi
+done < "$SNAPSHOT"
+rm -f "$SNAPSHOT" 2>/dev/null || true
+
+if [ -n "$LOST_LIST" ]; then
+    echo
+    warn "以下文件同步后与 $MIRROR_BRANCH 完全一致（同步前它们是有差异的）："
+    printf '%s' "$LOST_LIST"
+    warn "多数情况是上游采纳了同样的改动；但也可能是我们的改动被覆盖了。"
+    warn "本次合并还没推送，可以先看一眼再决定："
+    echo "    git diff $MIRROR_BRANCH..$WORK_BRANCH -- <上面的文件>"
+    echo "    git reset --hard ORIG_HEAD      # 整体撤销这次合并"
+fi
+
+# --- 汇总 --------------------------------------------------------------------
+echo
+if [ "$VERIFY_RC" -eq 0 ] && [ -z "$LOST_LIST" ]; then
+    ok "定制完好，可以继续。"
+    echo
+    echo "接下来："
+    echo "  1) 跑测试确认没被上游改动影响：  ./deploy/run-tests.sh"
+    echo "  2) 推到你自己的仓库：            git push origin $WORK_BRANCH"
+    echo "  3) 部署到 NAS：                  在 NAS 上跑 /root/deeperseeker/deploy/nas-deploy.sh"
+else
+    warn "校验发现问题，**先别推送**。上面已给出核对与撤销的命令。"
     exit 1
 fi
