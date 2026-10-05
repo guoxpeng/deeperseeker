@@ -1,11 +1,14 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import logging
 import mimetypes
 import os
 import random
 import re
+import secrets
 import sqlite3
 import string
 import time
@@ -103,6 +106,14 @@ def init_db():
             file_id TEXT PRIMARY KEY,
             token_id INTEGER,
             created_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at REAL,
+            last_login REAL,
+            created_by TEXT
         );
     """)
     # B3 (Stage 1 audit) migration: pool cooldown + usage tracking. Older
@@ -221,27 +232,188 @@ async def post_with_failover(path, *, headers, session=None, **kwargs):
     raise last_exc if last_exc is not None else RuntimeError("post_with_failover: no endpoints configured")
 
 
-# B11 (Stage 1 audit): the Android client identity used to be hardcoded to one
-# version for ALL tokens — when DeepSeek's app moves, a single stale string
-# degrades every account simultaneously, and identical fingerprints correlate
-# bans. The version is env-configurable now; per-token identity profiles
-# (rotating UA/version/locale) remain a P1.
+# ==============================================================================
+# B11 (Stage 1 audit) — per-token identity profiles
+#
+# The Android client identity used to be hardcoded for ALL tokens — when
+# DeepSeek's app moves, a single stale string degrades every account at once,
+# and *identical fingerprints correlate bans*. Making the version an env var
+# (the previous fix) removed the staleness risk but not the correlation risk:
+# every account still presented a byte-identical header set.
+#
+# Each token now gets a STABLE identity derived from the token itself. Account
+# A and account B no longer look like the same physical handset, while account
+# A keeps looking like the same handset across restarts — a fingerprint that
+# changes on every request is *more* suspicious than one that never changes.
+#
+#   DEEPSEEKER_IDENTITY_ROTATION   off | device | full      (default: device)
+#     off    exact legacy behaviour: one shared header set for every token.
+#     device rotate user-agent and timezone offset only. Version and locale
+#            stay pinned, because the upstream validates the *client version*
+#            whereas the UA is merely descriptive — real Android UAs differ
+#            per handset, so no sane WAF rule can key on one exact string.
+#            Safe default.
+#     full   also rotate x-client-version and locale. More diverse, but a
+#            stale entry in the version pool can be rejected upstream: set
+#            DEEPSEEKER_CLIENT_VERSION_POOL to the versions DeepSeek actually
+#            ships before enabling this.
+#
+#   DEEPSEEKER_CLIENT_VERSION       pins the version in off/device modes
+#   DEEPSEEKER_CLIENT_VERSION_POOL  comma-separated list, used by `full`
+#   DEEPSEEKER_USER_AGENT_POOL      comma-separated list, used by device/full
+#   DEEPSEEKER_TIMEZONE_POOL        comma-separated UTC offsets in seconds
+#   DEEPSEEKER_IDENTITY_SEED        optional salt; change it to re-shuffle
+#
+# HONEST SCOPE: this lowers the correlation *between accounts*. It does not
+# hide that the requests share one egress IP, one TLS fingerprint and one
+# machine-generated timing profile, and it does not make automated use
+# ToS-compliant. See README.zh-CN.md → 关于封号.
+# ==============================================================================
+
+def _env_list(name, default):
+    """Comma-separated env var -> tuple, falling back to `default` when unset
+    or blank. A malformed value degrades to the default rather than to an
+    empty pool (an empty pool would silently disable rotation)."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return tuple(default)
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())
+    return items or tuple(default)
+
+
+IDENTITY_ROTATION = (os.getenv("DEEPSEEKER_IDENTITY_ROTATION") or "").strip().lower() or "device"
+if IDENTITY_ROTATION not in ("off", "device", "full"):
+    logger.warning(
+        "Unknown DEEPSEEKER_IDENTITY_ROTATION=%r; falling back to 'device'", IDENTITY_ROTATION
+    )
+    IDENTITY_ROTATION = "device"
+
+IDENTITY_SEED = os.getenv("DEEPSEEKER_IDENTITY_SEED", "") or ""
+
 DEEPSEEKER_CLIENT_VERSION = os.getenv("DEEPSEEKER_CLIENT_VERSION", "2.4.5")
+
+# Index 0 of every pool reproduces the legacy value, so an `off` run and an
+# unlucky `full` pick both emit the exact pre-B11 header set.
+_USER_AGENT_POOL = _env_list("DEEPSEEKER_USER_AGENT_POOL", (
+    "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; SM-S918B)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; Pixel 6a)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; 2211133C)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; V2217A)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; CPH2451)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; SM-S911B)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; SM-A546B)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; 22127RK46C)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; PGZ110)",
+    "Dalvik/2.1.0 (Linux; U; Android 14; NE2210)",
+    "Dalvik/2.1.0 (Linux; U; Android 13; RMX3706)",
+))
+
+# Descriptive-only fields: nothing upstream validates these, so rotating them
+# costs nothing functionally and multiplies the identity space (12 x 6 = 72 in
+# `device` mode, vs 12 if the UA rotated alone). A phone's locale and its
+# timezone are genuinely independent in the real world, so this stays plausible.
+_TZ_OFFSET_POOL = _env_list("DEEPSEEKER_TIMEZONE_POOL", (
+    _TZ_OFFSET, "0", "-18000", "-28800", "32400", "36000",
+))
+
+_CLIENT_VERSION_POOL = _env_list("DEEPSEEKER_CLIENT_VERSION_POOL", (
+    DEEPSEEKER_CLIENT_VERSION, "2.4.4", "2.4.3",
+))
+
+# Semantic fields — the upstream reads the client version and may branch on the
+# locale, so these rotate only in `full` mode.
+_LOCALE_POOL = (
+    ("en_US", "en-US,en;q=0.9"),
+    ("en_GB", "en-GB,en;q=0.9"),
+    ("en_AU", "en-AU,en;q=0.9"),
+    ("en_CA", "en-CA,en;q=0.9"),
+)
+
+
+def _identity_stream(auth_token):
+    """32 deterministic pseudo-random bytes bound to one token.
+
+    Domain-separated and salted so the digest can never be mistaken for, or
+    used to verify a guess at, the token itself."""
+    material = "deeperseeker-identity-v1\x00" + IDENTITY_SEED + "\x00" + (auth_token or "")
+    return hashlib.sha256(material.encode("utf-8")).digest()
+
+
+def format_tz_offset(seconds):
+    """Seconds east of UTC -> compact 'UTC+8' / 'UTC-5' label."""
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return str(seconds)
+    sign = "+" if total >= 0 else "-"
+    hours, minutes = divmod(abs(total) // 60, 60)
+    return f"UTC{sign}{hours}" + (f":{minutes:02d}" if minutes else "")
+
+
+def resolve_identity(auth_token):
+    """The header identity this token presents upstream.
+
+    Deterministic by construction: the same token always yields the same
+    identity, across restarts and across worker processes. Different tokens
+    land on different combinations because each field draws from an
+    independent byte of the digest (12 UA x 6 timezone = 72 in `device` mode;
+    12 UA x 6 tz x 3 version x 4 locale = 864 in `full`).
+    """
+    identity = {
+        "user_agent": _USER_AGENT_POOL[0],
+        "client_version": DEEPSEEKER_CLIENT_VERSION,
+        "locale": _LOCALE_POOL[0][0],
+        "accept_language": _LOCALE_POOL[0][1],
+        "timezone_offset": _TZ_OFFSET_POOL[0],
+        "rotation": IDENTITY_ROTATION,
+    }
+    if IDENTITY_ROTATION == "off" or not auth_token:
+        return identity
+    stream = _identity_stream(auth_token)
+    identity["user_agent"] = _USER_AGENT_POOL[stream[0] % len(_USER_AGENT_POOL)]
+    identity["timezone_offset"] = _TZ_OFFSET_POOL[stream[1] % len(_TZ_OFFSET_POOL)]
+    if IDENTITY_ROTATION == "full":
+        identity["client_version"] = _CLIENT_VERSION_POOL[stream[2] % len(_CLIENT_VERSION_POOL)]
+        locale, accept_language = _LOCALE_POOL[stream[3] % len(_LOCALE_POOL)]
+        identity["locale"] = locale
+        identity["accept_language"] = accept_language
+    return identity
+
+
+def describe_identity(auth_token):
+    """Dashboard-friendly summary of the identity a token presents."""
+    identity = resolve_identity(auth_token)
+    ua = identity["user_agent"]
+    model = ua.rsplit("; ", 1)[-1].rstrip(")") if "; " in ua else ua
+    match = re.search(r"Android (\d+)", ua)
+    android = f"Android {match.group(1)}" if match else ""
+    parts = [part for part in (model, android, format_tz_offset(identity["timezone_offset"])) if part]
+    return {
+        "model": model,
+        "android": android,
+        "client_version": identity["client_version"],
+        "locale": identity["locale"],
+        "timezone": format_tz_offset(identity["timezone_offset"]),
+        "rotation": identity["rotation"],
+        "summary": " · ".join(parts),
+    }
 
 
 def get_headers(auth_token, pow=None):
+    identity = resolve_identity(auth_token)
     headers = {
         "accept": "*/*",
-        "accept-language": "en-US,en;q=0.9",
+        "accept-language": identity["accept_language"],
         "content-type": "application/json",
         "origin": "https://chat.deepseek.com",
         "referer": "https://chat.deepseek.com/",
-        "user-agent": "Dalvik/2.1.0 (Linux; U; Android 14; Pixel 7)",
+        "user-agent": identity["user_agent"],
         "x-client-platform": "android",
-        "x-client-version": DEEPSEEKER_CLIENT_VERSION,
-        "x-client-locale": "en_US",
+        "x-client-version": identity["client_version"],
+        "x-client-locale": identity["locale"],
         "x-client-bundle-id": "com.deepseek.chat",
-        "x-client-timezone-offset": _TZ_OFFSET,
+        "x-client-timezone-offset": identity["timezone_offset"],
     }
     if auth_token:
         headers["authorization"] = f"Bearer {auth_token}"
@@ -424,10 +596,247 @@ def add_token(token, alias=None):
 
 
 def get_tokens():
+    """Every token row, ordered by id.
+
+    Also returns `last_used` and `rate_limited_until` (B3 columns) so the
+    dashboard can show pool state without a second query. Callers that only
+    care about id/alias/token/status are unaffected — the extra keys are
+    additive.
+    """
     conn = get_db()
-    rows = conn.execute("SELECT id, alias, token, status FROM tokens").fetchall()
+    rows = conn.execute(
+        "SELECT id, alias, token, status, last_used, rate_limited_until "
+        "FROM tokens ORDER BY id"
+    ).fetchall()
     conn.close()
-    return [{"id": r[0], "alias": r[1], "token": r[2], "status": r[3]} for r in rows]
+    return [
+        {
+            "id": r[0],
+            "alias": r[1],
+            "token": r[2],
+            "status": r[3],
+            "last_used": r[4],
+            "rate_limited_until": r[5],
+        }
+        for r in rows
+    ]
+
+
+def get_token_stats():
+    """Aggregate pool summary for the dashboard.
+
+    `active` counts tokens that are usable RIGHT NOW: status ACTIVE, plus any
+    RATE_LIMITED token whose cooldown has already elapsed (the pool flips
+    those back to ACTIVE on the next pick, so counting them as unavailable
+    would understate capacity). `limited` is the remainder.
+    """
+    now = time.time()
+    conn = get_db()
+    total = conn.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+    active = conn.execute(
+        "SELECT COUNT(*) FROM tokens "
+        "WHERE status = 'ACTIVE' "
+        "   OR (status = 'RATE_LIMITED' "
+        "       AND (rate_limited_until IS NULL OR rate_limited_until <= ?))",
+        (now,),
+    ).fetchone()[0]
+    sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+    files = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    conn.close()
+    return {
+        "total": total,
+        "active": active,
+        "limited": max(0, total - active),
+        "sessions": sessions,
+        "files": files,
+    }
+
+
+# ==============================================================================
+# 控制台账号（多用户）
+#
+# 密码一律用 scrypt 加盐哈希后存库，绝不落明文。哈希串自带参数（n/r/p），
+# 以后调参也不影响老密码的校验。
+#
+# `.env` 里的 DEEPSEEKER_ADMIN_USER / DEEPSEEKER_ADMIN_PASSWORD **不写进这张表** ——
+# 它始终由环境变量权威提供，因此数据库被清空也不会把自己锁在门外；
+# 而这张表里的是「额外添加的账号」，与内置管理员同级。
+# ==============================================================================
+
+_SCRYPT_N = 2 ** 14   # 16384 —— 约 16MB 内存，登录一次几十毫秒，足够挡住离线爆破
+_SCRYPT_R = 8
+_SCRYPT_P = 1
+_SCRYPT_DKLEN = 32
+
+USERNAME_MAX_LEN = 32
+PASSWORD_MIN_LEN = 6
+PASSWORD_MAX_LEN = 200
+
+
+def hash_password(password):
+    """把明文密码转成 `scrypt$n$r$p$salt$hash` 形式的可存储字符串。"""
+    salt = secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode("utf-8"),
+        salt=salt,
+        n=_SCRYPT_N,
+        r=_SCRYPT_R,
+        p=_SCRYPT_P,
+        dklen=_SCRYPT_DKLEN,
+    )
+    return "$".join(
+        ["scrypt", str(_SCRYPT_N), str(_SCRYPT_R), str(_SCRYPT_P), salt.hex(), digest.hex()]
+    )
+
+
+def verify_password(password, stored):
+    """校验明文密码是否匹配 hash_password 的产出（常数时间比较，防时序侧信道）。"""
+    if not password or not stored:
+        return False
+    try:
+        scheme, n, r, p, salt_hex, hash_hex = stored.split("$")
+        if scheme != "scrypt":
+            return False
+        digest = hashlib.scrypt(
+            password.encode("utf-8"),
+            salt=bytes.fromhex(salt_hex),
+            n=int(n),
+            r=int(r),
+            p=int(p),
+            dklen=len(hash_hex) // 2,
+        )
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest.hex(), hash_hex)
+
+
+def validate_username(username):
+    """返回 (ok, 规范化后的用户名 或 错误信息)。
+
+    只允许字母、数字、下划线、连字符和点，长度 1..32 —— 用户名会被写进日志，
+    限制字符集可以避免日志伪造和看不见的字符混进来。
+    """
+    name = (username or "").strip()
+    if not name:
+        return False, "用户名不能为空。"
+    if len(name) > USERNAME_MAX_LEN:
+        return False, f"用户名最长 {USERNAME_MAX_LEN} 个字符。"
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]+", name):
+        return False, "用户名只能包含字母、数字、下划线、连字符和点。"
+    return True, name
+
+
+def validate_password(password):
+    """返回 (ok, 密码 或 错误信息)。"""
+    pw = password or ""
+    if len(pw) < PASSWORD_MIN_LEN:
+        return False, f"密码至少 {PASSWORD_MIN_LEN} 位。"
+    if len(pw) > PASSWORD_MAX_LEN:
+        return False, f"密码最长 {PASSWORD_MAX_LEN} 位。"
+    return True, pw
+
+
+def list_users():
+    """所有额外账号（不含 .env 内置管理员），按 id 升序。"""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, username, created_at, last_login, created_by FROM users ORDER BY id"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "id": r[0],
+            "username": r[1],
+            "created_at": r[2],
+            "last_login": r[3],
+            "created_by": r[4],
+        }
+        for r in rows
+    ]
+
+
+def count_users():
+    conn = get_db()
+    n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    conn.close()
+    return n
+
+
+def get_user(username):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT id, username, password_hash, created_at, last_login, created_by "
+        "FROM users WHERE username = ?",
+        (username,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {
+        "id": row[0],
+        "username": row[1],
+        "password_hash": row[2],
+        "created_at": row[3],
+        "last_login": row[4],
+        "created_by": row[5],
+    }
+
+
+def create_user(username, password, created_by=None):
+    """新增账号。用户名重复会抛 ValueError（供上层转成友好提示）。"""
+    ok, name = validate_username(username)
+    if not ok:
+        raise ValueError(name)
+    ok, pw = validate_password(password)
+    if not ok:
+        raise ValueError(pw)
+    conn = get_db()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, created_at, created_by) "
+            "VALUES (?, ?, ?, ?)",
+            (name, hash_password(pw), time.time(), created_by),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        raise ValueError(f"用户名「{name}」已存在。")
+    conn.close()
+    return name
+
+
+def delete_user(user_id):
+    conn = get_db()
+    cur = conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    conn.commit()
+    deleted = cur.rowcount
+    conn.close()
+    return deleted > 0
+
+
+def set_user_password(user_id, password):
+    ok, pw = validate_password(password)
+    if not ok:
+        raise ValueError(pw)
+    conn = get_db()
+    cur = conn.execute(
+        "UPDATE users SET password_hash = ? WHERE id = ?", (hash_password(pw), user_id)
+    )
+    conn.commit()
+    changed = cur.rowcount
+    conn.close()
+    return changed > 0
+
+
+def touch_user_login(username):
+    """记录最近一次登录时间（尽力而为，失败不影响登录）。"""
+    try:
+        conn = get_db()
+        conn.execute("UPDATE users SET last_login = ? WHERE username = ?", (time.time(), username))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        logger.exception("记录登录时间失败（非致命）")
 
 
 def get_token(token_id):
@@ -437,7 +846,6 @@ def get_token(token_id):
     if row:
         return {"id": row[0], "alias": row[1], "token": row[2], "status": row[3]}
     return None
-
 
 def delete_token(token_id):
     conn = get_db()
@@ -465,7 +873,11 @@ def delete_token(token_id):
 # ==============================================================================
 
 TOKEN_COOLDOWN_SECONDS = max(1, int(os.getenv("DEEPSEEKER_RATE_LIMIT_COOLDOWN", "60")))
-TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "8")))
+# Default lowered 8 -> 2: the cap is soft (capped tokens are used only when
+# nothing else is free), so 8 let a small pool absorb large bursts on one
+# account. 2 spreads the same load across more accounts and cuts the
+# per-account request-rate spike that risk scoring reacts to.
+TOKEN_CONCURRENCY_CAP = max(1, int(os.getenv("DEEPSEEKER_TOKEN_CONCURRENCY", "2")))
 
 # Per-token in-flight refcounts (per process; single event-loop worker). Every
 # send reserves one slot via acquire_token_slot() and releases it when the

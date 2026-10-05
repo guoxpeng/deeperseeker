@@ -1,21 +1,109 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{% block title %}DeeperSeeker{% endblock %}</title>
+    <title>{% block title %}DeeperSeeker 控制台{% endblock %}</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <link rel="stylesheet" href="/static/style.css">
+    <script>
+        /* 在首次绘制前确定主题，避免暗色环境下的白屏闪烁 */
+        (function () {
+            var t;
+            try {
+                t = localStorage.getItem("ds-theme");
+                if (t !== "light" && t !== "dark") {
+                    t = window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+                }
+            } catch (e) {
+                t = "light";
+            }
+            document.documentElement.setAttribute("data-theme", t);
+        })();
+    </script>
 </head>
-<body>
-    <nav>
-        <a href="/">Dashboard</a>
-        <span class="sep">|</span>
-        <a href="/logout">Logout</a>
-        <span class="sep">|</span>
-        <span class="brand">DeeperSeeker</span>
+<body class="{% block body_class %}{% endblock %}">
+    {% block nav %}
+    <nav class="topbar">
+        <a class="brand" href="/">
+            <img src="/static/favicon.svg" alt="">
+            <span>DeeperSeeker</span>
+        </a>
+        <div class="nav-links">
+            <a href="/" class="{% block nav_dashboard %}{% endblock %}">控制台</a>
+            <a href="/logout">退出登录</a>
+            <button type="button" class="theme-toggle" id="theme-toggle" title="切换亮色 / 暗色主题" aria-label="切换主题">🌙</button>
+        </div>
     </nav>
+    {% endblock %}
+
     <main>
         {% block content %}{% endblock %}
     </main>
+
+    {% block footer %}
+    <footer class="footer">DeeperSeeker · 基于 FastAPI 的 DeepSeek 网页版 API 反向代理</footer>
+    {% endblock %}
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        (function () {
+            var root = document.documentElement;
+            var btn = document.getElementById("theme-toggle");
+
+            function paint() {
+                if (btn) { btn.textContent = root.getAttribute("data-theme") === "dark" ? "☀️" : "🌙"; }
+            }
+            paint();
+
+            if (btn) {
+                btn.addEventListener("click", function () {
+                    var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+                    root.setAttribute("data-theme", next);
+                    try { localStorage.setItem("ds-theme", next); } catch (e) {}
+                    paint();
+                });
+            }
+
+            var toastEl = document.getElementById("toast");
+            var toastTimer = null;
+            function toast(msg) {
+                if (!toastEl) { return; }
+                toastEl.textContent = msg;
+                toastEl.classList.add("show");
+                clearTimeout(toastTimer);
+                toastTimer = setTimeout(function () { toastEl.classList.remove("show"); }, 1600);
+            }
+
+            function copyText(text) {
+                if (navigator.clipboard && window.isSecureContext) {
+                    return navigator.clipboard.writeText(text);
+                }
+                return new Promise(function (resolve, reject) {
+                    var ta = document.createElement("textarea");
+                    ta.value = text;
+                    ta.style.position = "fixed";
+                    ta.style.opacity = "0";
+                    document.body.appendChild(ta);
+                    ta.select();
+                    try { document.execCommand("copy"); resolve(); }
+                    catch (e) { reject(e); }
+                    finally { document.body.removeChild(ta); }
+                });
+            }
+
+            document.addEventListener("click", function (ev) {
+                var target = ev.target.closest("[data-copy]");
+                if (!target) { return; }
+                ev.preventDefault();
+                copyText(target.getAttribute("data-copy")).then(
+                    function () { toast("已复制到剪贴板"); },
+                    function () { toast("复制失败，请手动选择"); }
+                );
+            });
+        })();
+    </script>
+    {% block scripts %}{% endblock %}
 </body>
 </html>

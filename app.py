@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import mimetypes
@@ -6,13 +7,15 @@ import os
 import random
 import re
 import secrets
+import signal
 import time
 import unicodedata
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from urllib.parse import urlparse
+from datetime import datetime
+from urllib.parse import quote, urlparse
 
 import deepseek_tokenizer
 import uvicorn
@@ -44,9 +47,11 @@ from functions import (
     create_new_chat,
     delete_token,
     delete_sessions_for_chat,
+    describe_identity,
     find_session,
     get_auth_token,
     get_token,
+    get_token_stats,
     get_tokens,
     init_db,
     mark_limited,
@@ -63,6 +68,17 @@ from functions import (
     StreamToolParser,
     upload_file,
     get_file_content,
+    # 控制台多账号（账号由管理员在控制台添加，与内置管理员同级）
+    create_user,
+    count_users,
+    delete_user,
+    get_user,
+    list_users,
+    set_user_password,
+    touch_user_login,
+    validate_password,
+    validate_username,
+    verify_password,
 )
 
 
@@ -103,6 +119,7 @@ API_KEY, _api_key_generated = _resolve_api_key()
 ADMIN_USER = os.getenv("DEEPSEEKER_ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("DEEPSEEKER_ADMIN_PASSWORD", "admin")
 
+import tls_helper
 from middleware import RecovererMiddleware, RealIPMiddleware, RequestIDMiddleware
 from plugin_helper import (
     build_prompt,
@@ -162,6 +179,181 @@ def _log_security_banner():
 
 
 _log_security_banner()
+
+
+# ==============================================================================
+# HTTPS 监听（可选）
+#
+# 默认仍然只监听明文 HTTP，保持与历史行为一致。打开 DEEPSEEKER_HTTPS_ENABLED=1
+# 之后会**额外**起一个 HTTPS 监听（HTTP 继续保留，方便本机与 localhost 客户端）；
+# 想只跑 HTTPS 再设 DEEPSEEKER_HTTPS_ONLY=1。
+#
+# 证书来源两种，二选一：
+#   * 不配置路径  -> 自动生成自签证书，落在数据目录的 tls/ 下，开箱即用；
+#     把生成的 .crt 导入系统信任库即可消除浏览器警告。
+#   * 配置 DEEPSEEKER_HTTPS_CERT / DEEPSEEKER_HTTPS_KEY -> 使用你自己的证书，
+#     内网 CA 或正式 CA 签发的都行（SAN 记得写上实际访问用的 IP / 主机名）。
+#
+# 为什么需要 HTTPS：Claude Desktop 等客户端只接受 localhost 或 HTTPS 端点，
+# 局域网里用 IP 访问明文 HTTP 会被直接拒绝。
+# ==============================================================================
+
+
+def _env_flag(name, default=False):
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "y")
+
+
+def _env_int(name, default):
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("%s=%r 不是合法整数，回退到默认值 %d", name, raw, default)
+        return default
+
+
+HTTPS_ENABLED = _env_flag("DEEPSEEKER_HTTPS_ENABLED", False)
+HTTPS_ONLY = _env_flag("DEEPSEEKER_HTTPS_ONLY", False)
+HTTPS_PORT = _env_int("DEEPSEEKER_HTTPS_PORT", 4443)
+
+# ==============================================================================
+# 外部（反向代理）终止 TLS 的 HTTPS 入口
+#
+# 很多部署里 TLS 不在这个容器里做 —— 前面是 nginx / Traefik / fnOS 的
+# https_ssl 面板，容器本身只监听明文端口。这种情况下不该为了「页面上显示一个
+# HTTPS 地址」去打开 DEEPSEEKER_HTTPS_ENABLED（那会另起一个自签监听，
+# 反而多一张不受信的证书）。改成用这个变量把真实的 HTTPS 入口告诉控制台。
+#
+# 例：DEEPSEEKER_PUBLIC_HTTPS_URL=https://192.168.5.3:14000
+#     DEEPSEEKER_PUBLIC_HTTPS_NOTE=由 NAS 上的 https_ssl 面板签发（根证书已导入）
+#
+# 为什么不直接拼 request.base_url：用户完全可能正从明文端口访问控制台，
+# 那时候 base_url 是 http://，而客户端要填的是反代那侧的 https://。
+# ==============================================================================
+
+def _normalize_public_https_url(raw):
+    """校验并规范化 DEEPSEEKER_PUBLIC_HTTPS_URL。
+
+    只接受 https:// 开头；其余（含 http://、纯主机名、空串）一律返回 ""，
+    并记一条 warning —— 在「HTTPS 接入」区块里展示一个明文地址比不展示更糟。
+    """
+    value = (raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.lower().startswith("https://"):
+        logger.warning(
+            "DEEPSEEKER_PUBLIC_HTTPS_URL=%r 不是 https:// 开头，已忽略"
+            "（不能在「HTTPS 接入」区块里展示一个明文地址）",
+            value,
+        )
+        return ""
+    return value
+
+
+PUBLIC_HTTPS_URL = _normalize_public_https_url(os.getenv("DEEPSEEKER_PUBLIC_HTTPS_URL"))
+PUBLIC_HTTPS_NOTE = (os.getenv("DEEPSEEKER_PUBLIC_HTTPS_NOTE") or "").strip()
+
+# 解析结果缓存：证书只解析/生成一次，控制台渲染时不会重复触碰磁盘。
+_tls_state = {}
+
+
+def resolve_tls():
+    """解析 HTTPS 证书，返回 ``(cert_path, key_path, info)``。
+
+    未启用 HTTPS 时返回 ``(None, None, None)``。首次调用会按需生成自签证书，
+    之后走缓存。证书有问题时抛 ``tls_helper.TLSError``（启动阶段直接失败，
+    避免 uvicorn 抛一句难懂的 SSL 异常）。
+    """
+    if not HTTPS_ENABLED:
+        return None, None, None
+    if "cert" in _tls_state:
+        return _tls_state["cert"], _tls_state["key"], _tls_state["info"]
+
+    explicit_cert = (os.getenv("DEEPSEEKER_HTTPS_CERT") or "").strip()
+    explicit_key = (os.getenv("DEEPSEEKER_HTTPS_KEY") or "").strip()
+
+    if explicit_cert or explicit_key:
+        if not (explicit_cert and explicit_key):
+            raise tls_helper.TLSError(
+                "DEEPSEEKER_HTTPS_CERT 与 DEEPSEEKER_HTTPS_KEY 必须同时设置；"
+                "两个都留空则由程序自动生成自签证书。"
+            )
+        cert, key = explicit_cert, explicit_key
+        info = tls_helper.validate_pair(cert, key)
+        logger.info(
+            "使用配置的 TLS 证书：%s（主体：%s，到期：%s）",
+            cert, info["subject"], info["not_after"][:10],
+        )
+    else:
+        cert_dir = tls_helper.default_cert_dir(data_dir())
+        cert = os.path.join(cert_dir, "self-signed.crt")
+        key = os.path.join(cert_dir, "self-signed.key")
+        extra_san = tls_helper.parse_san_env(os.getenv("DEEPSEEKER_HTTPS_SAN"))
+        cert, key, info = tls_helper.ensure_certificate(cert, key, extra_san=extra_san)
+
+    if not tls_helper.is_readable_secret(key):
+        logger.warning(
+            "TLS 私钥对同组/其他用户可读，建议收紧权限：chmod 600 %s", key
+        )
+
+    _tls_state.update({"cert": cert, "key": key, "info": info})
+    return cert, key, info
+
+
+def _https_display_info(request):
+    """给控制台用的 HTTPS 展示信息。
+
+    证书状态走 ``resolve_tls()``（幂等且带缓存）：以 ``python app.py`` 启动时
+    这里直接命中缓存；被外部 ASGI 服务器加载时则按需解析一次，保证控制台
+    显示的证书信息与实际情况一致。证书有问题时不抛异常，改为在页面上提示。
+    """
+    if not HTTPS_ENABLED:
+        return None
+
+    host = request.url.hostname or "localhost"
+    display = {
+        "url": f"https://{host}:{HTTPS_PORT}",
+        "port": HTTPS_PORT,
+        "cert": None,
+        "self_signed": None,
+        "san": [],
+        "expires": "",
+        "only": HTTPS_ONLY,
+        "error": None,
+    }
+    try:
+        cert, _key, info = resolve_tls()
+    except tls_helper.TLSError as exc:
+        display["error"] = str(exc)
+        return display
+
+    display["cert"] = cert
+    display["self_signed"] = info.get("self_signed")
+    display["san"] = info.get("san") or []
+    display["expires"] = (info.get("not_after") or "")[:10]
+    return display
+
+
+def _public_https_info():
+    """外部反代终止 TLS 时的 HTTPS 入口信息；没配置就返回 None。
+
+    与 ``_https_display_info`` 的区别：那个描述的是「本容器自己监听的 HTTPS」，
+    这个描述的是「别人替我终止 TLS」的地址。两者可以同时存在，也可以只有其一。
+    """
+    if not PUBLIC_HTTPS_URL:
+        return None
+    return {
+        "url": PUBLIC_HTTPS_URL,
+        "openai_base": f"{PUBLIC_HTTPS_URL}/v1",
+        "anthropic_base": PUBLIC_HTTPS_URL,
+        "note": PUBLIC_HTTPS_NOTE or None,
+    }
+
 
 # The token used for this request, logged as "key: <alias>".
 # Must stay a dict: BaseHTTPMiddleware runs the endpoint in a child task, and
@@ -277,6 +469,9 @@ app.add_middleware(RecovererMiddleware)
 
 
 SESSIONS = {}
+# sid -> 登录时用的用户名。与 SESSIONS 分开存，是为了不改 SESSIONS 的值类型
+# （它历史上一直是 float 时间戳，外部测试也按 float 用）。
+SESSION_USERS = {}
 SESSION_TTL = 7 * 24 * 3600
 # B12 (Stage 1 audit): NOTE — SESSIONS (and _login_fails below) are per-process
 # admin state: they reset on restart and are not shared across workers. This
@@ -447,7 +642,29 @@ def get_current_admin(request: Request):
         parsed = urlparse(origin).netloc
         if parsed and parsed != request.headers.get("host", ""):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
-    return "admin"
+    return SESSION_USERS.get(sid) or ADMIN_USER
+
+
+def _authenticate(username, password):
+    """校验账号密码。命中返回用户名，否则返回 None。
+
+    两条路径：
+      1. `.env` 里的内置管理员（DEEPSEEKER_ADMIN_USER / _PASSWORD）—— 始终有效，
+         所以数据库丢了也不会把自己锁在门外；
+      2. `users` 表里由管理员添加的账号 —— 用 scrypt 哈希校验。
+    两者权限完全相同。
+    """
+    username = (username or "").strip()
+    if not username or not password:
+        return None
+    if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and \
+            secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        return ADMIN_USER
+    row = get_user(username)
+    if row and verify_password(password, row["password_hash"]):
+        touch_user_login(username)
+        return username
+    return None
 
 
 def get_api_key(request: Request):
@@ -1940,6 +2157,7 @@ def _prune_admin_sessions():
     expired = [sid for sid, ts in SESSIONS.items() if now - ts > SESSION_TTL]
     for sid in expired:
         SESSIONS.pop(sid, None)
+        SESSION_USERS.pop(sid, None)
 
 
 @app.post("/login", response_class=HTMLResponse)
@@ -1949,11 +2167,18 @@ async def login_submit(request: Request):
     password = form.get("password", "")
     _prune_admin_sessions()
     if time.time() < _login_fails["locked_until"]:
-        return templates.TemplateResponse(request, "login.html", {"error": "Too many attempts. Try again later."})
-    if secrets.compare_digest(username.encode("utf-8"), ADMIN_USER.encode("utf-8")) and secrets.compare_digest(password.encode("utf-8"), ADMIN_PASSWORD.encode("utf-8")):
+        wait = max(1, int(_login_fails["locked_until"] - time.time()) + 1)
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {"error": f"尝试次数过多，账号已被临时锁定，请约 {wait} 秒后再试。"},
+        )
+    account = _authenticate(username, password)
+    if account:
         _login_fails["count"] = 0
         sid = str(uuid.uuid4())
         SESSIONS[sid] = time.time()
+        SESSION_USERS[sid] = account
         resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
         resp.set_cookie("session_id", sid, httponly=True, samesite="lax")
         return resp
@@ -1961,26 +2186,119 @@ async def login_submit(request: Request):
     if _login_fails["count"] >= 5:
         _login_fails["locked_until"] = time.time() + 300
         _login_fails["count"] = 0
-    return templates.TemplateResponse(request, "login.html", {"error": "Invalid username or password"})
+    remaining = 5 - _login_fails["count"]
+    msg = "用户名或密码错误。"
+    if 0 < remaining <= 3:
+        msg += f"连续输错 5 次将锁定 5 分钟，剩余 {remaining} 次机会。"
+    return templates.TemplateResponse(request, "login.html", {"error": msg})
 
 
 @app.get("/logout")
 async def logout(request: Request):
     sid = request.cookies.get("session_id")
     SESSIONS.pop(sid, None)
+    SESSION_USERS.pop(sid, None)
     resp = HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     resp.delete_cookie("session_id")
     return resp
 
 
+def _fmt_ts(ts):
+    """Unix 时间戳 -> 本地时间字符串；空值/无效值返回 None。"""
+    try:
+        value = float(ts)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _mask_secret(value, head=6, tail=4):
+    """脱敏展示密钥：保留首尾便于辨认，中间以圆点遮蔽。"""
+    value = value or ""
+    if not value:
+        return "（未设置）"
+    dots = "\u2022" * 6
+    if len(value) <= head + tail:
+        return "\u2022" * len(value)
+    return value[:head] + dots + value[-tail:]
+
+
+def _api_key_source_text():
+    if os.getenv("DEEPSEEKER_API_KEY", "").strip():
+        return "密钥来源：.env 中的 DEEPSEEKER_API_KEY（由你手动配置）"
+    return f"密钥来源：启动时自动生成，保存在 {os.path.join(data_dir(), 'api_key.txt')}"
+
+
 @app.get("/dashboard")
 async def dashboard(request: Request):
     try:
-        get_current_admin(request)
+        current_user = get_current_admin(request)
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     tokens = await _db(get_tokens)
-    return templates.TemplateResponse(request, "dashboard.html", {"tokens": tokens})
+    stats = await _db(get_token_stats)
+    for tok in tokens:
+        tok["last_used_text"] = _fmt_ts(tok.get("last_used"))
+        tok["cooldown_text"] = _fmt_ts(tok.get("rate_limited_until"))
+        # Per-token client identity (B11). Surfaced so the rotation is
+        # verifiable at a glance — if two rows show the same device, the
+        # operator can re-shuffle with DEEPSEEKER_IDENTITY_SEED.
+        tok["identity"] = describe_identity(tok.get("token"))
+    base_url = str(request.base_url).rstrip("/")
+    api = {
+        "openai_base": f"{base_url}/v1",
+        "anthropic_base": base_url,
+        "model": SINGLE_MODEL,
+        "api_key": API_KEY,
+        "api_key_masked": _mask_secret(API_KEY),
+        "api_key_source": _api_key_source_text(),
+        "https": _https_display_info(request),
+        "public_https": _public_https_info(),
+    }
+    # 账号列表：内置管理员（来自 .env，不可删）+ 控制台添加的账号。
+    accounts = await _db(list_users)
+    for acc in accounts:
+        acc["created_text"] = _fmt_ts(acc.get("created_at"))
+        acc["last_login_text"] = _fmt_ts(acc.get("last_login"))
+    builtin = {
+        "username": ADMIN_USER,
+        "created_text": "—",
+        "last_login_text": "—",
+        "created_by": "环境变量 .env",
+    }
+    flash = None
+    q = request.query_params
+    if q.get("added") == "1":
+        flash = "令牌已添加，稍后会自动加入调度池。"
+    elif q.get("deleted") == "1":
+        flash = "令牌已删除。"
+    elif q.get("user_added") == "1":
+        flash = f"账号「{q.get('name', '')}」已创建。"
+    elif q.get("user_deleted") == "1":
+        flash = "账号已删除。"
+    elif q.get("user_pw") == "1":
+        flash = "密码已更新。"
+    elif q.get("user_err"):
+        flash = q.get("user_err")
+    return templates.TemplateResponse(
+        request,
+        "dashboard.html",
+        {
+            "tokens": tokens,
+            "stats": stats,
+            "api": api,
+            "flash": flash,
+            "flash_is_error": bool(q.get("user_err")),
+            "current_user": current_user,
+            "builtin_admin": builtin,
+            "accounts": accounts,
+        },
+    )
 
 
 @app.post("/tokens/add")
@@ -1991,10 +2309,15 @@ async def tokens_add(request: Request):
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     form = await request.form()
     auth_token = form.get("auth_token", "").strip().strip("'\"")
-    alias = form.get("alias", "").strip() or None
+    # Reuse the log-safety sanitizer so a pasted alias can never forge log
+    # lines or smuggle invisible characters into the access log.
+    alias = _sanitize_alias(form.get("alias", ""))
+    added = False
     if auth_token:
         await _db(add_token, auth_token, alias)
-    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+        added = True
+    target = "/dashboard?added=1" if added else "/dashboard"
+    return HTMLResponse(f"<meta http-equiv='refresh' content='0;url={target}'>")
 
 
 @app.post("/tokens/{token_id}/delete")
@@ -2004,7 +2327,83 @@ async def tokens_delete(token_id: int, request: Request):
     except HTTPException:
         return HTMLResponse("<meta http-equiv='refresh' content='0;url=/login'>")
     await _db(delete_token, token_id)
-    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard'>")
+    return HTMLResponse("<meta http-equiv='refresh' content='0;url=/dashboard?deleted=1'>")
+
+
+# ==============================================================================
+# 控制台账号管理
+#
+# 登录页**不提供自助注册** —— 账号一律由已登录的管理员在这里添加。
+# 新增账号与内置管理员（.env 里的那个）权限完全相同。
+# 内置管理员不存在 users 表里，因此不会被删掉，也不可能把自己锁在门外。
+# ==============================================================================
+
+
+def _redirect(target):
+    return HTMLResponse(f"<meta http-equiv='refresh' content='0;url={target}'>")
+
+
+def _user_err(msg):
+    return _redirect(f"/dashboard?user_err={quote(msg)}")
+
+
+@app.post("/users/add")
+async def users_add(request: Request):
+    try:
+        actor = get_current_admin(request)
+    except HTTPException:
+        return _redirect("/login")
+    form = await request.form()
+    username = form.get("username", "")
+    password = form.get("password", "")
+    confirm = form.get("password2", "")
+    ok, name = validate_username(username)
+    if not ok:
+        return _user_err(name)
+    if password != confirm:
+        return _user_err("两次输入的密码不一致。")
+    ok, msg = validate_password(password)
+    if not ok:
+        return _user_err(msg)
+    if name == ADMIN_USER:
+        return _user_err(f"「{name}」是内置管理员，请换一个用户名。")
+    try:
+        await _db(create_user, name, password, actor)
+    except ValueError as exc:
+        return _user_err(str(exc))
+    return _redirect(f"/dashboard?user_added=1&name={quote(name)}")
+
+
+@app.post("/users/{user_id}/delete")
+async def users_delete(user_id: int, request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return _redirect("/login")
+    removed = await _db(delete_user, user_id)
+    if not removed:
+        return _user_err("账号不存在，可能已被删除。")
+    return _redirect("/dashboard?user_deleted=1")
+
+
+@app.post("/users/{user_id}/password")
+async def users_password(user_id: int, request: Request):
+    try:
+        get_current_admin(request)
+    except HTTPException:
+        return _redirect("/login")
+    form = await request.form()
+    password = form.get("password", "")
+    confirm = form.get("password2", "")
+    if password != confirm:
+        return _user_err("两次输入的密码不一致。")
+    try:
+        changed = await _db(set_user_password, user_id, password)
+    except ValueError as exc:
+        return _user_err(str(exc))
+    if not changed:
+        return _user_err("账号不存在，可能已被删除。")
+    return _redirect("/dashboard?user_pw=1")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -2033,5 +2432,97 @@ async def health(request: Request):
     return JSONResponse(data, status_code=200 if ok else 503)
 
 
+class _SignalQuietServer(uvicorn.Server):
+    """不接管信号的 uvicorn Server。
+
+    uvicorn 每个 ``serve()`` 都会用 ``capture_signals()`` 把 SIGINT/SIGTERM
+    换成自己的 ``handle_exit``。当 HTTP 与 HTTPS 两个监听器跑在同一个事件循环里时，
+    后注册的那个会覆盖前一个 —— 结果是按一次 Ctrl+C 只有一半服务退出，
+    另一半一直挂着，进程永远结束不了。这里禁用它的接管，由 ``_serve_all()``
+    统一处理。
+    """
+
+    @contextlib.contextmanager
+    def capture_signals(self):
+        yield
+
+
+def _build_server(host, port, ssl_certfile=None, ssl_keyfile=None):
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        ssl_certfile=ssl_certfile,
+        ssl_keyfile=ssl_keyfile,
+    )
+    return _SignalQuietServer(config)
+
+
+def _serve_all(servers):
+    """在同一个事件循环里跑全部监听器。
+
+    必须共用同一个循环：``app.py`` / ``functions.py`` 里的会话锁、聊天锁都是
+    模块级 ``asyncio.Lock``，跨事件循环使用会直接抛
+    ``RuntimeError: ... is bound to a different event loop``。
+    """
+
+    async def _run():
+        state = {"shutting_down": False}
+
+        def _request_shutdown(*_args):
+            if state["shutting_down"]:
+                # 第二次 Ctrl+C：不再等待优雅关闭，直接强退。
+                for server in servers:
+                    server.force_exit = True
+                return
+            state["shutting_down"] = True
+            for server in servers:
+                server.should_exit = True
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _request_shutdown)
+            except (NotImplementedError, RuntimeError):
+                # Windows 的 ProactorEventLoop 不支持 add_signal_handler，
+                # 退回标准库信号处理（仅主线程有效）。
+                try:
+                    signal.signal(sig, lambda *_a: _request_shutdown())
+                except (ValueError, OSError):
+                    pass
+
+        await asyncio.gather(*(server.serve() for server in servers))
+
+    asyncio.run(_run())
+
+
+def main():
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "4000"))
+
+    servers = []
+    if not HTTPS_ONLY:
+        servers.append(_build_server(host, port))
+    if HTTPS_ENABLED:
+        cert, key, _info = resolve_tls()
+        servers.append(
+            _build_server(host, HTTPS_PORT, ssl_certfile=cert, ssl_keyfile=key)
+        )
+        logger.info("HTTPS 监听已启用：https://%s:%d", host, HTTPS_PORT)
+    if not servers:
+        raise SystemExit(
+            "没有任何监听器：DEEPSEEKER_HTTPS_ONLY=1 但没有打开 HTTPS。"
+            "请同时设置 DEEPSEEKER_HTTPS_ENABLED=1，或去掉 DEEPSEEKER_HTTPS_ONLY。"
+        )
+    if HTTPS_ENABLED and not HTTPS_ONLY and host in ("127.0.0.1", "localhost", "::1"):
+        logger.warning(
+            "HOST=%s 只监听本机 —— 局域网里的其它设备访问不到。"
+            "要让外部连上 HTTPS，请把 HOST 设为 0.0.0.0。",
+            host,
+        )
+
+    _serve_all(servers)
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host=os.getenv("HOST", "127.0.0.1"), port=int(os.getenv("PORT", "4000")))
+    main()

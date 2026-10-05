@@ -1,77 +1,408 @@
 {% extends "base.html" %}
-{% block title %}Dashboard - DeeperSeeker{% endblock %}
+{% block title %}控制台 - DeeperSeeker{% endblock %}
+{% block nav_dashboard %}active{% endblock %}
 {% block content %}
-<h1>Dashboard</h1>
+<h1>控制台</h1>
+<p class="subtitle">管理 DeepSeek 授权令牌，并查看 API 接入信息</p>
+
+{% if flash %}
+{% if flash_is_error %}
+<div class="warning">{{ flash }}</div>
+{% else %}
+<div class="notice">{{ flash }}</div>
+{% endif %}
+{% endif %}
+
+{% if stats.total == 0 %}
+<div class="warning">令牌池为空，服务当前不可用。请在下方「添加授权令牌」中至少添加一个令牌。</div>
+{% elif stats.active == 0 %}
+<div class="warning">当前没有可用令牌（全部处于限流冷却中），服务处于降级状态，请求可能失败。</div>
+{% endif %}
+
+<div class="stats">
+    <div class="stat-card is-accent">
+        <div class="stat-value">{{ stats.total }}</div>
+        <div class="stat-label">令牌总数</div>
+    </div>
+    <div class="stat-card is-ok">
+        <div class="stat-value">{{ stats.active }}</div>
+        <div class="stat-label">可用令牌</div>
+    </div>
+    <div class="stat-card {% if stats.limited %}is-warn{% endif %}">
+        <div class="stat-value">{{ stats.limited }}</div>
+        <div class="stat-label">限流冷却中</div>
+    </div>
+    <div class="stat-card">
+        <div class="stat-value">{{ stats.sessions }}</div>
+        <div class="stat-label">会话记录</div>
+    </div>
+</div>
 
 <section>
-    <h2>Add Auth Token</h2>
-    <div class="steps">
-        <p><strong>Steps:</strong></p>
-        <ol>
-            <li>Open <strong>incognito/private</strong> window</li>
-            <li>Go to <a href="https://chat.deepseek.com" target="_blank">chat.deepseek.com</a> and login</li>
-            <li>Open DevTools (F12) → Console → paste:</li>
-        </ol>
-        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
-        <ol start="4">
-            <li>Copy the token and paste below</li>
-            <li><strong>Remove any surrounding quotes</strong> — paste only the raw token string</li>
-            <li><strong>Close the incognito window</strong> to preserve the login</li>
-        </ol>
+    <h2>服务状态</h2>
+    <div class="kv-grid">
+        <div class="kv">
+            <span class="k">运行状态</span>
+            <span class="v">
+                {% if stats.active > 0 %}
+                <span class="badge ok">正常</span>
+                {% else %}
+                <span class="badge err">降级</span>
+                {% endif %}
+            </span>
+        </div>
+        <div class="kv">
+            <span class="k">默认模型</span>
+            <span class="v"><code>{{ api.model }}</code></span>
+        </div>
+        <div class="kv">
+            <span class="k">已记录文件</span>
+            <span class="v">{{ stats.files }}</span>
+        </div>
+        <div class="kv">
+            <span class="k">健康检查</span>
+            <span class="v"><a href="/health" target="_blank" rel="noopener">/health</a></span>
+        </div>
     </div>
-    <div class="warning">
-        If you logout from DeepSeek in browser, this token stops working.
-    </div>
-    <form method="post" action="/tokens/add">
-        <input type="text" name="alias" placeholder="Alias (optional, e.g. personal, work)" style="width:200px">
-        <input type="text" name="auth_token" placeholder="Paste auth token here (no quotes)" style="width:400px">
-        <button type="submit">Add Token</button>
-    </form>
 </section>
 
 <section>
-    <h2>Tokens ({{ tokens|length }})</h2>
-    {% if tokens %}
-    <table>
-        <thead>
-            <tr>
-                <th>ID</th>
-                <th>Alias</th>
-                <th>Token</th>
-                <th>Status</th>
-                <th>Actions</th>
-            </tr>
-        </thead>
-        <tbody>
-            {% for tok in tokens %}
-            <tr>
-                <td>{{ tok['id'] }}</td>
-                <td>{{ tok['alias'] or '—' }}</td>
-                <td><code>{{ tok['token'][:12] }}…{{ tok['token'][-4:] }}</code></td>
-                <td>
-                    <span class="status {% if tok['status'] == 'ACTIVE' %}ok{% elif tok['status'] == 'RATE_LIMITED' %}warn{% else %}err{% endif %}">
-                        {{ tok['status'] }}
-                    </span>
-                </td>
-                <td>
-                    <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
-                          onsubmit="return confirm('Delete?')">
-                        <button type="submit" class="btn-sm btn-danger">Delete</button>
-                    </form>
-                </td>
-            </tr>
-            {% endfor %}
-        </tbody>
-    </table>
-    {% else %}
-    <p>No tokens yet.</p>
+    <h2>账号管理</h2>
+    <p class="hint" style="margin-top:0;">
+        能登录本控制台的账号。内置管理员由 <code>.env</code> 提供、不可删除，
+        所以即使数据库丢失也不会被锁在门外；下面表格里是你在控制台添加的账号，
+        <strong>权限与内置管理员完全相同</strong>（都能管理令牌池）。登录页不提供自助注册。
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>用户名</th>
+                    <th>来源</th>
+                    <th>创建时间</th>
+                    <th>最近登录</th>
+                    <th style="text-align:right;">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td class="mono">
+                        {{ builtin_admin.username }}
+                        {% if current_user == builtin_admin.username %}<span class="badge ok">当前登录</span>{% endif %}
+                    </td>
+                    <td><span class="badge neutral">.env 内置</span></td>
+                    <td class="mono">{{ builtin_admin.created_text }}</td>
+                    <td class="mono">{{ builtin_admin.last_login_text }}</td>
+                    <td class="actions">—</td>
+                </tr>
+                {% for acc in accounts %}
+                <tr>
+                    <td class="mono">
+                        {{ acc.username }}
+                        {% if current_user == acc.username %}<span class="badge ok">当前登录</span>{% endif %}
+                    </td>
+                    <td><span class="badge neutral">控制台添加</span></td>
+                    <td class="mono">{{ acc.created_text or '—' }}</td>
+                    <td class="mono">{{ acc.last_login_text or '从未登录' }}</td>
+                    <td class="actions">
+                        <form method="post" action="/users/{{ acc.id }}/delete" style="display:inline"
+                              onsubmit="return confirm('确定要删除账号「{{ acc.username }}」吗？此操作不可撤销。')">
+                            <button type="submit" class="btn-sm btn-danger">删除</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <h3 style="margin-top:22px;">添加账号</h3>
+    <form method="post" action="/users/add">
+        <div class="form-row">
+            <div class="field">
+                <label for="new-username">用户名</label>
+                <input type="text" id="new-username" name="username" placeholder="字母 / 数字 / _ . -"
+                       maxlength="32" autocomplete="off" required>
+            </div>
+            <div class="field grow">
+                <label for="new-password">密码</label>
+                <input type="password" id="new-password" name="password" placeholder="至少 6 位"
+                       autocomplete="new-password" required>
+            </div>
+            <div class="field grow">
+                <label for="new-password2">确认密码</label>
+                <input type="password" id="new-password2" name="password2" placeholder="再输一次"
+                       autocomplete="new-password" required>
+            </div>
+            <button type="submit">添加账号</button>
+        </div>
+    </form>
+
+    {% if accounts %}
+    <h3 style="margin-top:18px;">重置密码</h3>
+    <form method="post" action="" id="pw-reset-form">
+        <div class="form-row">
+            <div class="field">
+                <label for="pw-account">账号</label>
+                <select id="pw-account">
+                    {% for acc in accounts %}
+                    <option value="/users/{{ acc.id }}/password">{{ acc.username }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+            <div class="field grow">
+                <label for="pw-password">新密码</label>
+                <input type="password" id="pw-password" name="password" placeholder="至少 6 位"
+                       autocomplete="new-password" required>
+            </div>
+            <div class="field grow">
+                <label for="pw-password2">确认新密码</label>
+                <input type="password" id="pw-password2" name="password2" placeholder="再输一次"
+                       autocomplete="new-password" required>
+            </div>
+            <button type="submit">重置密码</button>
+        </div>
+    </form>
     {% endif %}
 </section>
 
 <section>
-    <h2>API</h2>
-    <p>OpenAI: <code>http://localhost:4000/v1</code></p>
-    <p>Anthropic: <code>http://localhost:4000</code></p>
-    <p>Model: <code>v4.1flash</code> (single default DeepSeek model)</p>
+    <h2>添加授权令牌</h2>
+    <div class="warning">
+        建议使用专门注册的小号，不要使用日常主账号。在浏览器中退出 DeepSeek 登录后，该令牌会立即失效。
+    </div>
+    <div class="steps">
+        <ol>
+            <li>打开一个<strong>无痕 / 隐私窗口</strong></li>
+            <li>访问 <a href="https://chat.deepseek.com" target="_blank" rel="noopener">chat.deepseek.com</a> 并登录</li>
+            <li>按 <strong>F12</strong> 打开开发者工具 → 切到「控制台 / Console」→ 粘贴下面这行并回车：</li>
+        </ol>
+        <code>JSON.parse(localStorage.getItem("userToken")).value</code>
+        <ol start="4">
+            <li>复制输出的令牌，粘贴到下方输入框</li>
+            <li><strong>去掉首尾的引号</strong>，只保留令牌字符串本身</li>
+            <li><strong>直接关闭无痕窗口</strong>（不要点「退出登录」），否则令牌会失效</li>
+        </ol>
+    </div>
+    <form method="post" action="/tokens/add">
+        <div class="form-row">
+            <div class="field">
+                <label for="alias">备注（可选）</label>
+                <input type="text" id="alias" name="alias" placeholder="例如：个人、工作" maxlength="64" autocomplete="off">
+            </div>
+            <div class="field grow">
+                <label for="auth_token">授权令牌</label>
+                <input type="text" id="auth_token" name="auth_token" placeholder="粘贴令牌（不要带引号）" autocomplete="off">
+            </div>
+            <button type="submit">添加令牌</button>
+        </div>
+    </form>
 </section>
+
+<section>
+    <h2>令牌列表（{{ tokens|length }}）</h2>
+    {% if tokens %}
+    <p class="hint">
+        「客户端身份」是每个令牌向上游展示的设备指纹 —— 按令牌内容稳定派生，重启后不变、也不会随请求跳动。
+        若两个令牌显示同一身份，可修改 <code>DEEPSEEKER_IDENTITY_SEED</code> 后重启来重新分配。
+    </p>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    <th>ID</th>
+                    <th>备注</th>
+                    <th>令牌</th>
+                    <th>客户端身份</th>
+                    <th>状态</th>
+                    <th>最近使用</th>
+                    <th style="text-align:right;">操作</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for tok in tokens %}
+                <tr>
+                    <td class="mono">{{ tok['id'] }}</td>
+                    <td>{{ tok['alias'] or '—' }}</td>
+                    <td class="mono">
+                        <code>{{ tok['token'][:10] }}…{{ tok['token'][-4:] }}</code>
+                        <button type="button" class="btn-sm btn-ghost" data-copy="{{ tok['token'] }}">复制</button>
+                    </td>
+                    <td class="mono identity-cell"
+                        title="{{ tok['identity']['model'] }}｜{{ tok['identity']['android'] }}｜{{ tok['identity']['timezone'] }}｜客户端版本 {{ tok['identity']['client_version'] }}｜语言 {{ tok['identity']['locale'] }}">
+                        {{ tok['identity']['summary'] }}
+                    </td>
+                    <td>
+                        {% if tok['status'] == 'ACTIVE' %}
+                        <span class="badge ok">可用</span>
+                        {% elif tok['status'] == 'RATE_LIMITED' %}
+                        <span class="badge warn"
+                              {% if tok['cooldown_text'] %}title="预计 {{ tok['cooldown_text'] }} 恢复"{% endif %}>限流中</span>
+                        {% else %}
+                        <span class="badge neutral">{{ tok['status'] }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono">{{ tok['last_used_text'] or '从未使用' }}</td>
+                    <td class="actions">
+                        <form method="post" action="/tokens/{{ tok['id'] }}/delete" style="display:inline"
+                              onsubmit="return confirm('确定要删除该令牌吗？此操作不可撤销。')">
+                            <button type="submit" class="btn-sm btn-danger">删除</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="empty">
+        <span class="big">🗝️</span>
+        还没有任何令牌，请先在上方添加一个。
+    </div>
+    {% endif %}
+</section>
+
+<section>
+    <h2>API 接入信息</h2>
+    <p class="hint" style="margin-top:0;margin-bottom:10px;">
+        把下面的地址和密钥填入任意兼容 OpenAI / Anthropic 的客户端即可使用。
+    </p>
+    <div class="copy-row">
+        <span class="label">OpenAI Base URL</span>
+        <code>{{ api.openai_base }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.openai_base }}">复制</button>
+    </div>
+    <div class="copy-row">
+        <span class="label">Anthropic Base URL</span>
+        <code>{{ api.anthropic_base }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.anthropic_base }}">复制</button>
+    </div>
+    <div class="copy-row">
+        <span class="label">模型名称</span>
+        <code>{{ api.model }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.model }}">复制</button>
+    </div>
+    <div class="copy-row">
+        <span class="label">API Key</span>
+        <code id="api-key-display">{{ api.api_key_masked }}</code>
+        <button type="button" class="btn-sm btn-ghost" id="api-key-toggle">显示</button>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.api_key }}">复制</button>
+    </div>
+    <p class="hint">{{ api.api_key_source }}</p>
+
+    {% if api.public_https %}
+    <h2 style="margin-top:22px;">HTTPS 接入</h2>
+    <p class="hint" style="margin-top:0;">
+        下面这个地址由前面的反向代理终止 TLS，证书在代理侧，容器本身不监听 HTTPS 端口。
+        只接受 HTTPS 的客户端（如 Claude Desktop）请填这里。
+    </p>
+    <div class="copy-row">
+        <span class="label">HTTPS Base URL</span>
+        <code>{{ api.public_https.url }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.public_https.url }}">复制</button>
+    </div>
+    <div class="copy-row">
+        <span class="label">OpenAI Base URL</span>
+        <code>{{ api.public_https.openai_base }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.public_https.openai_base }}">复制</button>
+    </div>
+    <div class="copy-row">
+        <span class="label">Anthropic Base URL</span>
+        <code>{{ api.public_https.anthropic_base }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.public_https.anthropic_base }}">复制</button>
+    </div>
+    {% if api.public_https.note %}
+    <p class="hint">{{ api.public_https.note }}</p>
+    {% endif %}
+    {% endif %}
+
+    {% if api.https %}
+    <h2 style="margin-top:22px;">HTTPS 接入{% if api.public_https %}（容器自身监听）{% endif %}</h2>
+    {% if api.https.error %}
+    <div class="warning">HTTPS 已启用，但证书不可用：{{ api.https.error }}</div>
+    {% elif api.https.self_signed %}
+    <div class="warning">
+        当前使用的是<strong>自动生成的自签证书</strong>，客户端默认不信任它。
+        把下面的证书文件导入系统或浏览器的「受信任的根证书颁发机构」，即可消除安全警告；
+        也可以改用自己签发的证书（配置 <code>DEEPSEEKER_HTTPS_CERT</code> 与
+        <code>DEEPSEEKER_HTTPS_KEY</code>）。
+    </div>
+    {% endif %}
+    <div class="copy-row">
+        <span class="label">HTTPS Base URL</span>
+        <code>{{ api.https.url }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.https.url }}">复制</button>
+    </div>
+    {% if api.https.cert %}
+    <div class="copy-row">
+        <span class="label">证书文件</span>
+        <code>{{ api.https.cert }}</code>
+        <button type="button" class="btn-sm btn-ghost" data-copy="{{ api.https.cert }}">复制路径</button>
+    </div>
+    {% endif %}
+    {% if not api.https.error %}
+    <div class="kv-grid" style="margin-top:10px;">
+        <div class="kv">
+            <span class="k">证书类型</span>
+            <span class="v">
+                {% if api.https.self_signed %}
+                <span class="badge warn">自签</span>
+                {% else %}
+                <span class="badge ok">外部签发</span>
+                {% endif %}
+            </span>
+        </div>
+        <div class="kv">
+            <span class="k">到期时间</span>
+            <span class="v">{{ api.https.expires or '—' }}</span>
+        </div>
+        <div class="kv">
+            <span class="k">明文 HTTP</span>
+            <span class="v">
+                {% if api.https.only %}
+                <span class="badge neutral">已关闭</span>
+                {% else %}
+                <span class="badge ok">启用</span>
+                {% endif %}
+            </span>
+        </div>
+        <div class="kv">
+            <span class="k">监听端口</span>
+            <span class="v"><code>{{ api.https.port }}</code></span>
+        </div>
+    </div>
+    {% if api.https.san %}
+    <p class="hint">证书覆盖的地址：{% for name in api.https.san %}<code>{{ name }}</code>{% if not loop.last %} {% endif %}{% endfor %}</p>
+    {% endif %}
+    {% endif %}
+    {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    (function () {
+        var display = document.getElementById("api-key-display");
+        var toggle = document.getElementById("api-key-toggle");
+        if (!display || !toggle) { return; }
+        var full = {{ api.api_key|tojson }};
+        var masked = {{ api.api_key_masked|tojson }};
+        var shown = false;
+        toggle.addEventListener("click", function () {
+            shown = !shown;
+            display.textContent = shown ? full : masked;
+            toggle.textContent = shown ? "隐藏" : "显示";
+        });
+    })();
+
+    /* 重置密码：把下拉框选中的账号拼进表单 action（避免每个账号各渲染一份表单） */
+    (function () {
+        var form = document.getElementById("pw-reset-form");
+        var picker = document.getElementById("pw-account");
+        if (!form || !picker) { return; }
+        function sync() { form.setAttribute("action", picker.value); }
+        picker.addEventListener("change", sync);
+        sync();
+    })();
+</script>
 {% endblock %}

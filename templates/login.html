@@ -1,17 +1,30 @@
 {% extends "base.html" %}
-{% block title %}Login - DeeperSeeker{% endblock %}
+{% block title %}登录 - DeeperSeeker{% endblock %}
+{% block body_class %}no-nav{% endblock %}
+{% block nav %}{% endblock %}
+{% block footer %}{% endblock %}
 {% block content %}
-<h1>Login</h1>
-{% if error %}
-<p style="color:red;">{{ error }}</p>
-{% endif %}
-<form method="post" action="/login">
-    <div style="margin-bottom:10px;">
-        <input type="text" name="username" placeholder="Username" required style="width:300px;">
+<div class="login-wrap">
+    <div class="login-card">
+        <div class="logo"><img src="/static/favicon.svg" alt="DeeperSeeker"></div>
+        <h1>登录控制台</h1>
+        <p class="subtitle">请输入管理员账号以继续</p>
+
+        {% if error %}
+        <p class="error-msg">{{ error }}</p>
+        {% endif %}
+
+        <form method="post" action="/login">
+            <div class="field">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" placeholder="请输入用户名" required autofocus autocomplete="username">
+            </div>
+            <div class="field">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" placeholder="请输入密码" required autocomplete="current-password">
+            </div>
+            <button type="submit" class="btn-block">登 录</button>
+        </form>
     </div>
-    <div style="margin-bottom:10px;">
-        <input type="password" name="password" placeholder="Password" required style="width:300px;">
-    </div>
-    <button type="submit">Login</button>
-</form>
+</div>
 {% endblock %}
