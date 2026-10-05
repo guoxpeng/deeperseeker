@@ -4,6 +4,9 @@ deeperseeker.db
 *.db.bak
 .venv/
 .env
+# 部署时对 .env 做的备份（含密钥，绝不入库）
+.env.bak-*
+.env.*.bak
 .omo/
 api_key.txt
 deeperseeker.db-wal
