@@ -1,5 +1,7 @@
 # DeeperSeeker
 
+**English** | [简体中文](README.zh-CN.md)
+
 DeepSeek website reverse-proxy server with FastAPI, supporting OpenAI & Anthropic API standards.
 
 If you want to use deeperseeker with claude desktop app see [Claude Desktop Setup Guide](CLAUDE_DESKTOP_SETUP.md)
@@ -15,6 +17,19 @@ Use at your own risk.
 
 A kind request: do not spam the server, respect DeepSeek's limits, and use it for personal purposes only.
 
+> **Note on this fork** — the interface is fully localized to Chinese and the
+> project gained an HTTPS listener, a Docker entrypoint that fixes data-volume
+> ownership automatically, and **per-token client identities** (each token
+> presents a stable, distinct Android fingerprint instead of every account
+> sharing one). See [README.zh-CN.md](README.zh-CN.md) → 关于封号 for the honest
+> risk boundary: this lowers the correlation between accounts, it does not make
+> automated use safe or compliant.
+>
+> Upgrading an existing Docker deployment: just `docker compose up -d`. The
+> container now starts as root, re-owns the data volume to uid 10001 and drops
+> privileges — the manual `chown` step is gone. For read-only mounts set
+> `DEEPSEEKER_SKIP_CHOWN=1`.
+
 
 ## Quickstart
 
@@ -28,6 +43,13 @@ python3 app.py
 ```
 
 > **Note:** Thanks to PR https://github.com/AmanCode22/deeperseeker/pull/16 by [@alan7383](https://github.com/alan7383), Playwright and Chromium are deprecated and kept as backup (DeepSeek does not enforce AWS WAF on requests using Android client headers). You no longer need to run `playwright install chromium` or `xvfb-run` unless reverting to the backup cookie mechanism. And it now saves ram also and is much stable than cookie harvesting.
+>
+> Accordingly, `playwright` is **no longer a default dependency** — `requirements.txt` only ships what the default path needs. If you do revert to the backup cookie mechanism, install it separately:
+>
+> ```bash
+> pip install -r requirements-playwright.txt
+> playwright install chromium
+> ```
 
 ### Docker / Podman (Podman recommended for rootless execution)
 
@@ -63,7 +85,7 @@ cp .env.example .env
 
 | Variable | Description | Default |
 |---|---|---|
-| `DEEPSEEKER_API_KEY` | Bearer API key required to access endpoints | `dseeker` |
+| `DEEPSEEKER_API_KEY` | Bearer API key required to access endpoints | unset → a strong key is generated, persisted next to the DB, and shown in the dashboard |
 | `DEEPSEEKER_ADMIN_USER` | Dashboard login username | `admin` |
 | `DEEPSEEKER_ADMIN_PASSWORD` | Dashboard login password | `admin` |
 | `HOST` | Bind address for bare-metal runs (`127.0.0.1` = local only, `0.0.0.0` = expose) | `127.0.0.1` |
@@ -76,6 +98,43 @@ cp .env.example .env
 | `DEEPSEEKER_ROLLOVER_SAFETY_TOKENS` | Headroom reserved below the memory limit before summarizing | `24000` |
 | `DEEPSEEKER_MAX_SUMMARY_TOKENS` | Budget for the model-generated handoff summary | `4096` |
 | `DEEPSEEKER_PER_TOOL_RESULT_TOKENS` | Per-result tool-output cap (so one giant output can't eat the budget) | `2000` |
+| `DEEPSEEKER_HTTPS_ENABLED` | Also listen for HTTPS | `0` (off) |
+| `DEEPSEEKER_HTTPS_PORT` | HTTPS listen port | `4443` |
+| `DEEPSEEKER_HTTPS_ONLY` | Serve HTTPS only, no plain HTTP listener | `0` |
+| `DEEPSEEKER_HTTPS_CERT` / `DEEPSEEKER_HTTPS_KEY` | Your own certificate + key (leave both empty to auto-generate a self-signed one) | empty |
+| `DEEPSEEKER_HTTPS_SAN` | Extra DNS names / IPs for the self-signed certificate (comma-separated) | empty |
+
+## HTTPS
+
+Plain HTTP remains the default (unchanged behaviour). HTTPS is required for any
+client that is **not** on localhost — Claude Desktop, for example, rejects
+plain-HTTP endpoints on the LAN.
+
+```bash
+# .env
+HOST=0.0.0.0                     # 127.0.0.1 would make the port unreachable from other devices
+DEEPSEEKER_HTTPS_ENABLED=1
+DEEPSEEKER_HTTPS_PORT=4443
+DEEPSEEKER_HTTPS_SAN=nas.local   # optional: add the hostname you actually browse to
+```
+
+On startup a self-signed certificate (10-year validity) is generated into
+`<data dir>/tls/self-signed.crt`, with SAN entries for `localhost`, the machine
+hostname, `127.0.0.1`, `::1`, the default-route LAN IP, plus anything in
+`DEEPSEEKER_HTTPS_SAN`. To make browsers show a normal lock, import that `.crt`
+into the trusted root store — the dashboard shows the exact path.
+
+To use your own certificate instead, point `DEEPSEEKER_HTTPS_CERT` and
+`DEEPSEEKER_HTTPS_KEY` at it. Both must be supplied together. The pair is
+validated at startup (matching key, not expired) and the process fails with a
+clear message rather than letting uvicorn raise an opaque SSL error.
+
+> ⚠️ The certificate's SAN must contain the address clients actually use — IP
+> if you browse by IP, hostname if you browse by hostname. This is the most
+> common cause of "the certificate is installed but the browser still complains".
+
+HTTP and HTTPS both listen by default once enabled; set
+`DEEPSEEKER_HTTPS_ONLY=1` to drop the plain-HTTP listener.
 
 ## Auth Token Setup
 

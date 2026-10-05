@@ -16,6 +16,23 @@ __*Credential Type*__: Static API Key
 
 __*Gateway base URL*__ : http://localhost:4000/ (must be https if not localhost and don't add any /v1,etc)
 
+> **Using DeeperSeeker from another machine?** The gateway URL must be HTTPS.
+> Turn on the built-in HTTPS listener — see the "HTTPS" section of the README:
+>
+> ```bash
+> # .env
+> HOST=0.0.0.0
+> DEEPSEEKER_HTTPS_ENABLED=1
+> DEEPSEEKER_HTTPS_PORT=4443
+> ```
+>
+> A self-signed certificate is generated on first start; use
+> `https://<host-ip>:4443/` as the gateway base URL. Import the generated
+> `tls/self-signed.crt` into your trusted root store to silence the browser
+> warning, or point `DEEPSEEKER_HTTPS_CERT` / `DEEPSEEKER_HTTPS_KEY` at your own
+> certificate. Remember the certificate's SAN must contain the address you
+> actually connect to.
+
 __*Gateway API key*__ : Add your configured API key or default is dseeker
 
 __*Gateway auth scheme*__ : x-api-key/bearer (DeeperSeeker supports both)

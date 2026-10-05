@@ -8,3 +8,12 @@ deeperseeker.db
 api_key.txt
 deeperseeker.db-wal
 deeperseeker.db-shm
+
+# 本地界面预览产物（由工具生成，不入库）
+.preview/
+
+# 自动生成的自签 TLS 证书与私钥（含私钥，绝不入库）
+tls/
+
+# 本地工作区数据（记忆 / 预览等），不属于项目代码
+.workbuddy-ai/
