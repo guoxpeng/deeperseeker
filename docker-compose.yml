@@ -1,6 +1,9 @@
 services:
   deeperseeker:
     build: .
+    # 显式给镜像起名，否则 compose 会生成 deeperseeker-deeperseeker 这种名字，
+    # 写 docker run / 打备份标签时都得先猜一遍。
+    image: deeperseeker:local
     container_name: deeperseeker
     ports:
       # 默认只绑回环（安全）。要让局域网里的其它设备（Claude Desktop 等）连上，
