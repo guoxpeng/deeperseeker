@@ -70,12 +70,7 @@ else
 fi
 [ "$CHECK_ONLY" -eq 1 ] && exit 0
 
-# --- 3. 记录同步前的定制清单（合并后用来核对没被吞掉）------------------------
-SNAPSHOT="$(mktemp 2>/dev/null || echo "/tmp/deeperseeker-custom-$$.txt")"
-git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null || true
-CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
-info "相对 $MIRROR_BRANCH 的定制文件共 ${CUSTOM_TOTAL:-0} 个，已记录，合并后会逐个核对。"
-
+# --- 3. 记录还原点并做基线校验 ----------------------------------------------
 # 还原点：把 $BACKUP_BRANCH 指到同步前的 $WORK_BRANCH。
 # 它只是个本地分支，不会被 push；好处是过很久也能一键回到「同步之前」，
 # 而 ORIG_HEAD 只记得最近一次操作。
@@ -104,6 +99,17 @@ if ! git merge --ff-only "$UPSTREAM_REMOTE/main" >/dev/null 2>&1; then
 然后再跑一次本脚本。"
 fi
 ok "$MIRROR_BRANCH -> $(git rev-parse --short HEAD)"
+
+# --- 4.5 记录定制清单（必须在 main 快进**之后**取）---------------------------
+# ⚠️ 时机很关键：此刻 main 已经是新上游、custom 还没合并，所以
+#    `main..custom` 的差集正好就是「我们自己的改动」。
+#    若在快进之前取，main 还停在旧上游，差集里会混进一大堆
+#    「上游后来改过、但我们没碰」的文件 —— 合并后它们自然与 main 一致，
+#    于是被误判成「定制丢失」（真机实测踩过：NAS 上误报了 20 多个 tests/*）。
+SNAPSHOT="$(mktemp 2>/dev/null || echo "/tmp/deeperseeker-custom-$$.txt")"
+git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null || true
+CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
+info "我们的定制文件共 ${CUSTOM_TOTAL:-0} 个，合并后会逐个核对是否仍与 $MIRROR_BRANCH 不同。"
 
 # --- 5. 合并进定制分支 -------------------------------------------------------
 info "切到 $WORK_BRANCH 并合并 $MIRROR_BRANCH…"
