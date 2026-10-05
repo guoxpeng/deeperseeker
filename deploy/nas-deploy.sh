@@ -5,22 +5,28 @@
 # 在 NAS 上执行（需要 root 或 docker 权限）：
 #   /root/deeperseeker/deploy/nas-deploy.sh
 #
-# 前置条件（只需做一次）：
+# 首次使用（脚本会自动完成分支切换，只需保证 remote 指向你自己的仓库）：
 #   cd /root/deeperseeker
 #   git remote set-url origin https://github.com/guoxpeng/deeperseeker.git
-#   git checkout custom
+#   git fetch origin
+#   ./deploy/nas-deploy.sh              # 或先 DEPLOY_DRY_RUN=1 看一眼
 #
 # 设计要点：
 #   * 脚本会先把「自己」复制到 /tmp 再执行 —— 因为脚本本身在仓库里，
 #     `git reset --hard` 会把它替换掉，而正在执行的 shell 脚本被就地替换
 #     会让解释器读错行。
+#   * 分支切换用 `checkout -f -B` 而不是 `reset --hard`：
+#     NAS 上最初可能停在 main（上游镜像）且带着一堆未提交改动，
+#     直接 reset 会把 main 挪到 custom 的位置，分支就乱了。
 #   * .env 与数据卷都不在 git 里（.gitignore 已忽略），git reset 不会碰它们。
 #   * 验收不过不会自动回滚，但会打印回滚命令。
 #
 # 环境变量：
-#   DEPLOY_BRANCH  默认 custom
-#   DEPLOY_REMOTE  默认 origin
-#   DEPLOY_DIR     默认 /root/deeperseeker
+#   DEPLOY_BRANCH    默认 custom
+#   DEPLOY_REMOTE    默认 origin
+#   DEPLOY_DIR       默认 /root/deeperseeker
+#   DEPLOY_HTTPS_URL 默认 https://192.168.5.3:14000/
+#   DEPLOY_DRY_RUN   设 1 则只做 fetch + 切分支，不重建镜像
 # =============================================================================
 set -eu
 
@@ -29,6 +35,9 @@ REMOTE="${DEPLOY_REMOTE:-origin}"
 REPO_DIR="${DEPLOY_DIR:-/root/deeperseeker}"
 HEALTH_URL="http://127.0.0.1:4000/health"
 HTTPS_URL="${DEPLOY_HTTPS_URL:-https://192.168.5.3:14000/}"
+DRY_RUN="${DEPLOY_DRY_RUN:-0}"
+
+die() { printf '\033[31m%s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- 自举：复制到 /tmp 再跑，避免 git reset 把自己换掉 ----------------------
 if [ "${DEPLOY_REEXEC:-}" != "1" ]; then
@@ -40,29 +49,53 @@ if [ "${DEPLOY_REEXEC:-}" != "1" ]; then
     DEPLOY_REMOTE="$REMOTE" \
     DEPLOY_DIR="$REPO_DIR" \
     DEPLOY_HTTPS_URL="$HTTPS_URL" \
+    DEPLOY_DRY_RUN="$DRY_RUN" \
     exec sh "$TMP" "$@"
 fi
 
 cd "$REPO_DIR"
 
 echo "=============== 0. 基线 ==============="
+OLD_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 OLD_COMMIT="$(git rev-parse HEAD)"
-echo "  当前提交: $(git rev-parse --short HEAD)  ($(git log -1 --format=%s))"
-echo "  数据卷:   $(docker volume ls --format '{{.Name}}' | grep deeperseeker || echo '?')"
-echo "  .env:     $(md5sum .env 2>/dev/null | cut -d' ' -f1 || echo '缺失')"
+DIRTY="$(git status --porcelain | wc -l | tr -d ' ')"
+echo "  当前分支: $OLD_BRANCH @ $(git rev-parse --short HEAD)  ($(git log -1 --format=%s))"
+echo "  未提交改动: $DIRTY 个"
+echo "  数据卷:   $(docker inspect deeperseeker --format '{{range .Mounts}}{{.Name}}{{.Source}} -> {{.Destination}} {{end}}' 2>/dev/null || echo '?')"
+echo "  .env:     $([ -f .env ] && md5sum .env | cut -d' ' -f1 || echo '缺失')"
 
 echo
 echo "=============== 1. 拉取 $REMOTE/$BRANCH ==============="
 git fetch "$REMOTE" --prune
-git reset --hard "$REMOTE/$BRANCH"
+git rev-parse --verify --quiet "$REMOTE/$BRANCH" >/dev/null \
+    || die "  $REMOTE/$BRANCH 不存在。先把本地 $BRANCH 推上去：git push $REMOTE $BRANCH"
+
+CUR_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
+if [ "$CUR_BRANCH" != "$BRANCH" ]; then
+    echo "  当前在 $CUR_BRANCH，切换到 $BRANCH（丢弃 $DIRTY 个未提交改动）"
+    git checkout -f -B "$BRANCH" "$REMOTE/$BRANCH"
+else
+    git reset --hard "$REMOTE/$BRANCH"
+fi
 git --no-pager log --oneline -5
 
 echo
 echo "=============== 2. 校验 .env 未被改动 ==============="
-echo "  .env md5: $(md5sum .env 2>/dev/null | cut -d' ' -f1 || echo '缺失')"
 if [ ! -f .env ]; then
     echo "  ⚠️  没有 .env —— 端口会退回默认的 127.0.0.1 绑定，局域网将无法访问。"
-    echo "     请在 .env 里设置 DEEPSEEKER_BIND=0.0.0.0"
+    echo "     请创建 .env 并设置 DEEPSEEKER_BIND=0.0.0.0"
+elif ! grep -q '^DEEPSEEKER_BIND=' .env; then
+    echo "  ⚠️  .env 里没有 DEEPSEEKER_BIND —— compose 会把端口绑到 127.0.0.1，"
+    echo "     外部反向代理（14000）会连不上。请加一行："
+    echo "         DEEPSEEKER_BIND=0.0.0.0"
+fi
+echo "  .env md5: $([ -f .env ] && md5sum .env | cut -d' ' -f1 || echo '缺失')"
+
+if [ "$DRY_RUN" = "1" ]; then
+    echo
+    echo "DEPLOY_DRY_RUN=1 —— 已完成 fetch 与分支切换，未重建镜像、未重启容器。"
+    echo "回滚分支：cd $REPO_DIR && git checkout -f $OLD_BRANCH"
+    exit 0
 fi
 
 echo
@@ -104,7 +137,11 @@ d.close()
 
 echo
 echo "=============== 7. 回滚方法 ==============="
-echo "  cd $REPO_DIR && git reset --hard $OLD_COMMIT && docker compose up -d --build"
+if [ "$CUR_BRANCH" != "$BRANCH" ]; then
+    echo "  cd $REPO_DIR && git checkout -f $OLD_BRANCH && docker compose up -d --build"
+else
+    echo "  cd $REPO_DIR && git reset --hard $OLD_COMMIT && docker compose up -d --build"
+fi
 echo
 if [ "$HEALTH" = "healthy" ]; then
     echo "✅ 部署完成，health=$HEALTH"
