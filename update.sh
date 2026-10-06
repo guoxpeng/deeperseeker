@@ -100,16 +100,28 @@ if ! git merge --ff-only "$UPSTREAM_REMOTE/main" >/dev/null 2>&1; then
 fi
 ok "$MIRROR_BRANCH -> $(git rev-parse --short HEAD)"
 
-# --- 4.5 记录定制清单（必须在 main 快进**之后**取）---------------------------
-# ⚠️ 时机很关键：此刻 main 已经是新上游、custom 还没合并，所以
-#    `main..custom` 的差集正好就是「我们自己的改动」。
-#    若在快进之前取，main 还停在旧上游，差集里会混进一大堆
-#    「上游后来改过、但我们没碰」的文件 —— 合并后它们自然与 main 一致，
-#    于是被误判成「定制丢失」（真机实测踩过：NAS 上误报了 20 多个 tests/*）。
+# --- 4.5 记录定制清单（必须用 merge-base，且必须在 main 快进**之后**取）------
+# ⚠️ 两个坑，都踩过：
+#
+#   (1) 基准要用「共同祖先」，不能直接用 $MIRROR_BRANCH。
+#       若拿 $MIRROR_BRANCH（= 上游最新）当基准，差集里会混进「上游单方面改过、
+#       我们没碰」的文件（以及上游新增的文件）。合并后它们自然与 main 一致，
+#       于是被误判成「定制丢失」。真实上游有 24 个新提交时实测误报 30 个文件
+#       （含 18 个 tests/*、uv.lock、pyproject.toml 等）。
+#
+#   (2) 位置要在 main 快进**之后**。
+#       此时 merge-base($MIRROR_BRANCH, $WORK_BRANCH) 正好是「我们上次同步到的
+#       那个上游提交」，差集就是纯粹「我们自己的改动」。
+#       若在快进之前取，merge-base 会落到本地那个落后的 main 上，差集又会混进
+#       上游后来的改动 —— 同一个误报换个姿势再来一次。
 SNAPSHOT="$(mktemp 2>/dev/null || echo "/tmp/deeperseeker-custom-$$.txt")"
-git diff --name-only "$MIRROR_BRANCH" "$WORK_BRANCH" > "$SNAPSHOT" 2>/dev/null || true
+SNAPSHOT_RAW="${SNAPSHOT}.raw"
+SNAPSHOT_BASE="$(git merge-base "$MIRROR_BRANCH" "$WORK_BRANCH" 2>/dev/null || echo "$MIRROR_BRANCH")"
+git diff --name-status "$SNAPSHOT_BASE" "$WORK_BRANCH" > "$SNAPSHOT_RAW" 2>/dev/null || true
+# 状态 D = 我们主动删掉的文件：合并后它本就该不存在，不参与「丢失」核对。
+grep -v '^D' "$SNAPSHOT_RAW" 2>/dev/null | cut -f2- > "$SNAPSHOT" 2>/dev/null || true
 CUSTOM_TOTAL="$(grep -c . "$SNAPSHOT" 2>/dev/null || true)"
-info "我们的定制文件共 ${CUSTOM_TOTAL:-0} 个，合并后会逐个核对是否仍与 $MIRROR_BRANCH 不同。"
+info "我们的定制文件共 ${CUSTOM_TOTAL:-0} 个（相对上次同步的上游提交 $(git rev-parse --short "$SNAPSHOT_BASE")），合并后会逐个核对是否还在。"
 
 # --- 5. 合并进定制分支 -------------------------------------------------------
 info "切到 $WORK_BRANCH 并合并 $MIRROR_BRANCH…"
@@ -157,11 +169,11 @@ while IFS= read -r f; do
 "
     fi
 done < "$SNAPSHOT"
-rm -f "$SNAPSHOT" 2>/dev/null || true
+rm -f "$SNAPSHOT" "$SNAPSHOT_RAW" 2>/dev/null || true
 
 if [ -n "$LOST_LIST" ]; then
     echo
-    warn "以下文件同步后与 $MIRROR_BRANCH 完全一致（同步前它们是有差异的）："
+    warn "以下文件同步后与 $MIRROR_BRANCH 完全一致（同步前它们带着我们的改动）："
     printf '%s' "$LOST_LIST"
     warn "多数情况是上游采纳了同样的改动；但也可能是我们的改动被覆盖了。"
     warn "本次合并还没推送，可以先看一眼再决定："
