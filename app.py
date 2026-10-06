@@ -182,6 +182,135 @@ _log_security_banner()
 
 
 # ==============================================================================
+# 自动续跑（DEEPSEEKER_AUTO_CONTINUE）
+#
+# 问题：上游网页版模型在长 agent 轨迹里偶尔会「宣布计划然后就结束回合」——
+#   输出一句「我发现了几个可疑点，逐一验证」就置 finish_reason=stop，
+#   既不调工具也不再产出。客户端（OpenCode 等）收到 stop 就退出循环，
+#   用户看到的就是「回复到一半自动停止」。
+#
+# 实测（2026-10-06）：不是服务端 bug，是上游模型的概率性行为。
+#   典型特征：无工具调用 + 输出极短（实测 21~26 token）+ 文本含后续意图词。
+#
+# 本机制：在把上游流交给客户端之前先缓冲，若判定为「疑似撂挑子」，
+#   自动向同一 chat 追问一轮「继续」，把两轮文本合并后再流式吐给客户端。
+#
+# 代价（必须知情）：
+#   1) 会多一次上游往返（但你手动打「继续」同样是一次往返，净增量为零）；
+#   2) 判定需要缓冲整轮文本，被判定为「疑似」的那一轮会有额外延迟；
+#   3) 时间分布略微更机器化 —— 若上游是网页版抓取通道，存在轻微封号增量风险。
+# 因此**默认关闭**，由 DEEPSEEKER_AUTO_CONTINUE=1 显式开启。
+# ==============================================================================
+
+AUTO_CONTINUE = (os.getenv("DEEPSEEKER_AUTO_CONTINUE") or "").strip().lower() in ("1", "true", "yes", "on")
+# 输出短于该 token 数才可能是撂挑子（实测撂挑子 21~26，正常短回复也常有 60+）
+AUTO_CONTINUE_MAX_TOKENS = int(os.getenv("DEEPSEEKER_AUTO_CONTINUE_MAX_TOKENS", "80") or 80)
+# 最多追问几轮，防止死循环
+AUTO_CONTINUE_MAX_ROUNDS = int(os.getenv("DEEPSEEKER_AUTO_CONTINUE_MAX_ROUNDS", "1") or 1)
+# 追问时补发的用户消息
+AUTO_CONTINUE_PROMPT = os.getenv("DEEPSEEKER_AUTO_CONTINUE_PROMPT") or "继续。不要只描述计划，直接调用工具把它做完。"
+
+# 「表示后续动作」的意图词 —— 命中才判定为撂挑子。
+# 注意：故意**不含**「完成」「总结」这类收尾词，避免把正常结束误判。
+_AUTO_CONTINUE_INTENT_RE = re.compile(
+    r"(我要|我准备|我打算|接下来|下面|然后|接着|继续|先看|先检查|先确认|逐一|逐个|"
+    r"让我|让我先|需要看|去看|去看一下|去检查|去确认|直接测|实际测|实测|"
+    r"now verify|now check|now let|now i|now,|"
+    r"let me|i'll|i will|next,|then i|continue|let's|going to)",
+    re.IGNORECASE,
+)
+
+
+def should_auto_continue(text: str, out_tokens: int, parsed_tools) -> bool:
+    """判定这一轮是不是「宣布计划就不动了」。
+
+    三重条件必须同时满足，宁可漏判也不误判（误判会让正常短回复被追问）：
+      ① 没有解析出工具调用；
+      ② 输出极短（< AUTO_CONTINUE_MAX_TOKENS）；
+      ③ 文本命中「后续意图词」，且**不是**一个像样的收尾。
+    """
+    if parsed_tools:
+        return False
+    if not text or not text.strip():
+        return False
+    if out_tokens >= AUTO_CONTINUE_MAX_TOKENS:
+        return False
+    return bool(_AUTO_CONTINUE_INTENT_RE.search(text))
+
+
+async def _auto_continue_stream(gen, session_id, token, prompt, parent_message_id,
+                                thinking, search, file_ids, model, tool_names):
+    """把上游流缓冲后判定；疑似撂挑子则追问一轮，合并输出。
+
+    之所以缓冲而不是边收边发：判定「是否撂挑子」必须看完整轮文本，
+    而 HTTP 响应一旦开始就无法撤回。折中——只对「无工具调用」的短轮次
+    额外缓冲（这类轮次本来就没什么内容可流式），有工具调用的轮次立即透传。
+
+    实现要点：先缓冲**全部**文本用于判定，但如果在缓冲过程中发现出现了
+    工具调用标记，就说明是正常工作轮 —— 立刻把已缓冲内容放出去并转为透传。
+    """
+    buf = ""
+    passthrough = False
+    async for chunk in gen:
+        if passthrough:
+            yield chunk
+            continue
+        buf += chunk
+        # 一旦文本里出现工具标记，就是正常工作轮，立刻转入透传
+        if tool_names and parse_tools(buf)[0]:
+            passthrough = True
+            yield buf
+            buf = ""
+            continue
+    if passthrough:
+        return
+
+    parsed, clean = parse_tools(buf)
+    out_tokens = count_tok(clean) if clean else 0
+    if not should_auto_continue(clean, out_tokens, parsed):
+        yield buf
+        return
+
+    logger.info(
+        "auto_continue: suspected stall (out_tokens=%d) — asking upstream to continue: %r",
+        out_tokens, clean[:120],
+    )
+
+    rounds = 0
+    merged = buf
+    while rounds < AUTO_CONTINUE_MAX_ROUNDS:
+        rounds += 1
+        try:
+            follow_gen = send_message(
+                session_id, token,
+                # 追问以「用户补充」的形式发，避免污染 assistant 历史
+                AUTO_CONTINUE_PROMPT,
+                parent_message_id, thinking, search, file_ids or [],
+            )
+            follow_gen = await _preflight_stream(follow_gen)
+            extra = ""
+            async for c in follow_gen:
+                extra += c
+        except Exception:
+            logger.exception("auto_continue: follow-up round failed; emitting what we have")
+            break
+        if not extra.strip():
+            break
+        merged += extra
+        parsed2, clean2 = parse_tools(merged)
+        out2 = count_tok(clean2) if clean2 else 0
+        # 追问后拿到工具调用或足够长的正文，就停手
+        if parsed2 or out2 >= AUTO_CONTINUE_MAX_TOKENS:
+            logger.info("auto_continue: recovered (out_tokens=%d, tools=%d)", out2, len(parsed2))
+            break
+
+    # 流式吐出合并后的内容。注意：这里刻意整段 yield，因为缓冲区本就不大
+    # （判定条件是「短」），而且 stream_response 会照常做工具解析与 done 收尾。
+    if merged:
+        yield merged
+
+
+# ==============================================================================
 # HTTPS 监听（可选）
 #
 # 默认仍然只监听明文 HTTP，保持与历史行为一致。打开 DEEPSEEKER_HTTPS_ENABLED=1
@@ -1089,6 +1218,15 @@ async def handle_chat(
         if stream:
             gen = _release_chat_lock_stream(gen, lock_owner, slot)
             lock_transferred = True
+            if AUTO_CONTINUE and not is_anthropic:
+                # 自动续跑：缓冲判定 + 疑似撂挑子时追问一轮。
+                # 只在流式 + 非 Anthropic 路径启用（Anthropic 的 block 语义更复杂，
+                # 先不碰；需要时再单独实现）。
+                gen = _auto_continue_stream(
+                    gen, session_id, tok["token"], prompt, parent_message_id,
+                    thinking, search, file_ids, model,
+                    {t.get("function", {}).get("name") for t in (tools or []) if isinstance(t, dict)},
+                )
             if is_anthropic:
                 return StreamingResponse(stream_anthropic_response(gen, model, messages, token_id, session_id, sig, tools, req_model, parent_message_id, scope), media_type="text/event-stream")
             return StreamingResponse(stream_response(gen, model, messages, token_id, session_id, sig, tools, parent_message_id, scope), media_type="text/event-stream")
